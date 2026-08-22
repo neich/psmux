@@ -851,9 +851,16 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
     if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
-            win.active_path = path.clone();
-            let (row, col) = copy_cell_for_area(*area, x, y);
+        // Prefer the pane under the pointer; fall back to the active
+        // (copy-mode) pane so a drag that leaves every pane rect still
+        // extends the selection and can auto-scroll at the edges.
+        let target = rects.iter()
+            .find(|(_, area)| area.contains(ratatui::layout::Position { x, y }))
+            .or_else(|| rects.iter().find(|(p, _)| *p == win.active_path))
+            .map(|(p, a)| (p.clone(), *a));
+        if let Some((path, area)) = target {
+            win.active_path = path;
+            let (row, col) = copy_cell_for_area(area, x, y);
             if app.copy_anchor.is_none() {
                 // Only start selection when mouse moves to a different cell
                 // than the click position. Prevents micro-drag jitter (#199).
@@ -865,6 +872,15 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((row, col));
+            // tmux parity (#62): dragging on/past the pane's first or last
+            // row scrolls the view so the selection continues into scrollback.
+            if y <= area.y {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_up(app, 1);
+            } else if y + 1 >= area.y + area.height {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_down(app, 1);
+            }
         }
         return;
     }
@@ -916,13 +932,22 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
                 return;
             }
         }
-        // Auto-yank if real selection exists (anchor != pos), else clear stale anchor
+        // Auto-yank if a real selection exists, else clear the stale anchor.
+        // Compare CONTENT positions (screen row minus the scroll offset it
+        // was recorded at, as yank_selection does), not screen cells: edge
+        // auto-scroll can park the release on the anchor's screen cell
+        // while the selection spans many scrolled lines.
         if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-            if a != p {
+            let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
+            let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+            if (a_abs, a.1) != (p_abs, p.1) {
                 let _ = yank_selection(app);
-            } else {
-                app.copy_anchor = None;
             }
+            // tmux parity (#62): ending a drag cancels copy mode and
+            // returns to the live view (copy-pipe-and-cancel) even when
+            // the selection came up empty, matching the pane-mouse
+            // release path.
+            exit_copy_mode(app);
         }
         return;
     }
@@ -1162,17 +1187,34 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
 
     // Handle copy mode: position cursor with pane-relative coordinates
     if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-        let r = row.max(0) as u16;
-        let c = col.max(0) as u16;
+        // Visible pane extent, for clamping and edge detection.  The client
+        // sends drag/release coordinates unclamped, so an out-of-range row
+        // is the signal that the pointer crossed a pane edge.
+        let (rows_v, cols_v) = {
+            let w = &app.windows[app.active_idx];
+            active_pane(&w.root, &w.active_path)
+                .map(|p| (p.last_rows, p.last_cols))
+                .unwrap_or((0, 0))
+        };
+        let max_r = (rows_v.saturating_sub(1)) as i16;
+        let max_c = (cols_v.saturating_sub(1)) as i16;
+        let r = row.clamp(0, max_r.max(0)) as u16;
+        let c = col.clamp(0, max_c.max(0)) as u16;
         if button == 0 && press {
             // Left press: position cursor, clear selection
             app.copy_anchor = None;
             app.copy_pos = Some((r, c));
             app.copy_mouse_down_cell = Some((r, c));
         } else if button == 32 {
-            // Left drag: extend selection, but ignore same-cell micro-jitter (#199)
+            // Left drag: extend selection, but ignore same-cell micro-jitter
+            // (#199) — only while the RAW coordinates are still inside the
+            // pane.  A drag past an edge clamps onto the click cell too
+            // (press on the first row, drag straight up), but the pointer
+            // leaving the pane is a real drag that must start the selection
+            // and auto-scroll below, never jitter.
+            let raw_in_range = row >= 0 && row <= max_r && col >= 0 && col <= max_c;
             if app.copy_anchor.is_none() {
-                if app.copy_pos == Some((r, c)) {
+                if raw_in_range && app.copy_pos == Some((r, c)) {
                     return; // same cell as click, ignore jitter
                 }
                 app.copy_anchor = Some(app.copy_pos.unwrap_or((r, c)));
@@ -1180,6 +1222,23 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((r, c));
+            // tmux parity (#62): dragging on/past the pane's first or last
+            // row scrolls the view so the selection keeps growing into
+            // scrollback; speed rises with distance past the edge.  The
+            // client re-sends the last drag every 50ms while the pointer
+            // dwells there, which is what makes the scroll continuous.
+            // Once the view scrolls this is definitely a drag, so drop the
+            // pending click cell: the release-side #199 guard compares
+            // screen cells, which scrolling invalidates — a release on the
+            // same screen cell would otherwise be mistaken for a click and
+            // discard the selection.
+            if row <= 0 {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_up(app, 1 + ((-row) as usize / 2).min(4));
+            } else if row >= max_r {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_down(app, 1 + ((row - max_r) as usize / 2).min(4));
+            }
         } else if button == 0 && !press {
             // Left release: finalize position
             app.copy_pos = Some((r, c));
@@ -1193,9 +1252,25 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                     return;
                 }
             }
-            // Auto-yank if real selection exists (anchor != pos)
+            // Auto-yank if a real selection exists.  Compare CONTENT
+            // positions (screen row minus the scroll offset it was recorded
+            // at, as yank_selection does), not screen cells: edge
+            // auto-scroll can park the release on the anchor's screen cell
+            // while the selection spans many scrolled lines.
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-                if a != p { let _ = yank_selection(app); }
+                let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
+                let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+                if (a_abs, a.1) != (p_abs, p.1) {
+                    let _ = yank_selection(app);
+                }
+                // tmux parity (#62): ending a drag cancels copy mode and
+                // returns to the live view (copy-pipe-and-cancel), even
+                // when the selection came up empty — e.g. a drag past the
+                // top of a pane with no scrollback, where the edge scroll
+                // was a no-op and the pointer clamped back onto the
+                // anchor.  An anchor here always means a real drag: plain
+                // clicks were snapped back by the guards above.
+                exit_copy_mode(app);
             }
         }
         return;
@@ -1226,6 +1301,76 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
             let event_flags = if button == 32 || button == 35 { mouse_inject::MOUSE_MOVED } else { 0 };
             inject_mouse_combined(pane, col, row, button, press, button_state, event_flags, &win_name);
         }
+    }
+}
+
+/// Hand a normal-mode client-side drag selection off to copy mode.
+///
+/// The client sends this when a drag at the shell prompt reaches the pane's
+/// top edge — or, when the view is direct-scrolled (scroll-enter-copy-mode
+/// off, #193), its bottom edge: the visible screen has run out, so the
+/// selection must continue into scrollback (tmux parity — a prompt drag is
+/// a copy-mode selection).  `anchor` is the cell where the drag started and
+/// `cur` the current pointer cell, both pane-relative 0-based; out-of-range
+/// values are clamped.  From here on the client keeps sending regular
+/// `pane-mouse 32` drags, which auto-scroll at the edges (see
+/// handle_pane_mouse).
+pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anchor_row: i16,
+                       col: i16, row: i16, rect_sel: bool) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. } | Mode::PopupMode { .. }) {
+        return;
+    }
+
+    // Find and focus the pane the drag started in.
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    let mut found_path: Option<Vec<usize>> = None;
+    for (path, _area) in &rects {
+        if let Some(pid) = crate::tree::get_active_pane_id(&win.root, path) {
+            if pid == pane_id {
+                found_path = Some(path.clone());
+                break;
+            }
+        }
+    }
+    let Some(path) = found_path else { return; };
+    if win.active_path != path {
+        win.active_path = path.clone();
+        if let Some(pid) = crate::tree::get_active_pane_id(&win.root, &path) {
+            crate::tree::touch_mru(&mut win.pane_mru, pid);
+        }
+    }
+    let (rows_v, cols_v) = active_pane(&win.root, &path)
+        .map(|p| (p.last_rows, p.last_cols))
+        .unwrap_or((0, 0));
+    if rows_v == 0 || cols_v == 0 { return; }
+
+    // enter_copy_mode keeps a direct-scrolled view (scroll-enter-copy-mode
+    // off, #193): the drag was made over the content currently on screen,
+    // and copy_scroll_offset starts at the parser's live scrollback, so the
+    // anchor below lands at the offset the user was looking at.
+    enter_copy_mode(app);
+    let max_r = (rows_v - 1) as i16;
+    let max_c = (cols_v - 1) as i16;
+    app.copy_anchor = Some((anchor_row.clamp(0, max_r) as u16, anchor_col.clamp(0, max_c) as u16));
+    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+    app.copy_selection_mode = if rect_sel {
+        crate::types::SelectionMode::Rect
+    } else {
+        crate::types::SelectionMode::Char
+    };
+    app.copy_pos = Some((row.clamp(0, max_r) as u16, col.clamp(0, max_c) as u16));
+    // A drag is in progress, not a click: the release must yank, never
+    // snap back through the #199 click guard.
+    app.copy_mouse_down_cell = None;
+    // The handoff fires with the pointer at/past an edge — start scrolling
+    // immediately so the selection keeps growing (the bottom edge only
+    // moves when the view was scrolled back; at offset 0 it is a no-op).
+    if row <= 0 {
+        scroll_copy_up(app, 1 + ((-row) as usize / 2).min(4));
+    } else if row >= max_r {
+        scroll_copy_down(app, 1 + ((row - max_r) as usize / 2).min(4));
     }
 }
 
@@ -1731,6 +1876,240 @@ mod window_ops_tests {
         super::handle_pane_scroll(&mut app, 41, true, None);
         assert!(matches!(app.mode, Mode::Passthrough));
         assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_at_top_edge_scrolls_into_history() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Press at row 2, then drag to the pane's top row: the view scrolls.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        assert_eq!(app.copy_anchor, Some((2, 5)));
+        assert_eq!(app.copy_pos, Some((0, 5)));
+        let after_edge = app.copy_scroll_offset;
+        assert!(after_edge > base, "drag on the top row must scroll up");
+
+        // Re-sending the same drag (the client's 50ms dwell repeat) keeps scrolling.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        assert!(app.copy_scroll_offset > after_edge, "dwell repeat must keep scrolling");
+
+        // Distance past the edge scrolls faster than the top row itself.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -8, true);
+        assert!(app.copy_scroll_offset >= o + 5, "far past the edge must scroll faster");
+        assert_eq!(app.copy_pos, Some((0, 5)), "cursor clamps to the top row");
+    }
+
+    #[test]
+    fn copy_drag_at_bottom_edge_scrolls_back_down() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+        assert!(base >= 6, "two wheel reports must scroll six lines");
+
+        // Press at row 3, drag to the last visible row (7 of 8): scrolls down.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 3, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert!(app.copy_scroll_offset < base, "drag on the last row must scroll down");
+
+        // Past the bottom edge: cursor clamps, scroll continues faster.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 12, true);
+        assert!(app.copy_scroll_offset < o);
+        assert_eq!(app.copy_pos, Some((7, 5)), "cursor clamps to the last row");
+    }
+
+    #[test]
+    fn copy_drag_straight_up_from_top_row_scrolls() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Press ON the top row, then drag straight up out of the pane with
+        // no horizontal movement: the clamped position lands back on the
+        // click cell, but crossing the edge is a real drag, not #199
+        // jitter — the selection must start and the view must scroll.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 0, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -1, true);
+        assert_eq!(app.copy_anchor, Some((0, 5)), "edge drag must start the selection");
+        assert!(app.copy_scroll_offset > base, "edge drag must scroll despite the same clamped cell");
+
+        // Dwell repeats at the same raw position keep scrolling.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -1, true);
+        assert!(app.copy_scroll_offset > o, "dwell repeat must keep scrolling");
+    }
+
+    #[test]
+    fn copy_drag_straight_down_from_bottom_row_scrolls() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+        assert!(base >= 6, "two wheel reports must scroll six lines");
+
+        // Press ON the last visible row (7 of 8), drag straight down past
+        // the pane: same clamped cell, but the view must scroll back down.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 8, true);
+        assert_eq!(app.copy_anchor, Some((7, 5)), "edge drag must start the selection");
+        assert!(app.copy_scroll_offset < base, "edge drag must scroll back down");
+    }
+
+    #[test]
+    fn empty_edge_drag_release_exits_copy_mode() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // A drag journey that ends exactly where it started: up to the top
+        // edge (scrolls one line), down to the bottom edge (scrolls back),
+        // release on the anchor's content position.  Nothing is selected,
+        // but the drag still ends — tmux's copy-pipe-and-cancel cancels
+        // copy mode either way, it never leaves the user stranded there.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, base, "the two edge scrolls must cancel out");
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
+        assert!(app.paste_buffers.is_empty(), "an empty selection must not yank");
+        assert!(matches!(app.mode, Mode::Passthrough), "an empty drag must still exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn legacy_mouse_release_after_edge_scroll_yanks_and_exits() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Legacy screen-coordinate protocol (mouse-down/drag/up x y):
+        // press at row 2, drag onto the top row — the view edge-scrolls.
+        super::remote_mouse_down(&mut app, 5, 2);
+        super::remote_mouse_drag(&mut app, 5, 0);
+        assert!(app.copy_scroll_offset > base, "drag on the top row must scroll up");
+
+        // Release on the SAME screen cell as the press: the scroll made
+        // this a real multi-line selection, so it must yank (content
+        // positions), not be discarded by a screen-cell anchor == pos
+        // comparison.
+        super::remote_mouse_up(&mut app, 5, 2);
+        assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
+        assert!(app.paste_buffers[0].contains('\n'), "yank must span the scrolled lines");
+        // A mouse yank cancels copy mode and returns to live view (#62),
+        // same as the pane-mouse release path.
+        assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn enter_copy_mode_preserves_direct_scrolled_view() {
+        let mut app = make_scrollback_app(true);
+        // scroll-enter-copy-mode off (#193): the wheel scrolls the pane's
+        // parser directly, without entering copy mode.
+        app.scroll_enter_copy_mode = false;
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough), "direct scroll must not enter copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+
+        // Keyboard entry (prefix-[) over the scrolled view: copy mode must
+        // anchor its offset at the view on screen, not reset to 0 while
+        // the parser stays scrolled.
+        crate::copy_mode::enter_copy_mode(&mut app);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        assert_eq!(app.copy_scroll_offset, 6, "copy mode must keep the direct-scrolled view");
+    }
+
+    #[test]
+    fn copy_drag_release_after_edge_scroll_yanks_and_exits() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true); // scrolls the view
+        // Release on the SAME screen cell as the press: scrolling made this
+        // a real multi-line drag, so it must yank rather than be snapped
+        // back to a click — both the #199 click guard and the anchor/pos
+        // comparison work on screen cells, which the scroll invalidated.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
+        assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
+        // Char-mode selection from (row 2, col 5)@offset 3 to (row 0, col 5)
+        // @offset 4 spans the two scrollback lines history-71/history-72,
+        // sliced at col 5 on both ends.
+        assert_eq!(app.paste_buffers[0], "ry-71\nhistor", "yank must span the scrolled lines");
+        // A mouse yank cancels copy mode and returns to live view (#62).
+        assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_begin_from_direct_scroll_preserves_offset_and_scrolls_down() {
+        let mut app = make_scrollback_app(true);
+        // scroll-enter-copy-mode off (#193): the wheel scrolls the pane's
+        // parser directly, without entering copy mode.
+        app.scroll_enter_copy_mode = false;
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough), "direct scroll must not enter copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+
+        // A drag selection over the scrolled view reached the bottom row
+        // (7 of 8): the client hands off with the bottom-edge position.
+        super::copy_drag_begin(&mut app, 41, 5, 3, 5, 7, false);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        // The direct-scrolled view (offset 6) is preserved and anchors the
+        // selection; the bottom edge starts scrolling toward the live view.
+        assert_eq!(app.copy_anchor, Some((3, 5)));
+        assert_eq!(app.copy_anchor_scroll_offset, 6, "anchor must keep the direct-scroll offset");
+        assert_eq!(app.copy_scroll_offset, 5, "bottom-edge handoff must scroll down one line");
+
+        // Dwell drags on the bottom row keep scrolling toward the live view.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, 4);
+
+        // At the live bottom the scroll clamps instead of wrapping.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_begin_hands_prompt_drag_off_to_copy_mode() {
+        let mut app = make_scrollback_app(true);
+        assert!(matches!(app.mode, Mode::Passthrough));
+
+        // A prompt drag that started at (col 10, row 5) crossed the top
+        // edge (row -1): the client hands the selection off to copy mode.
+        super::copy_drag_begin(&mut app, 41, 10, 5, 10, -1, false);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        assert_eq!(app.copy_anchor, Some((5, 10)));
+        assert_eq!(app.copy_pos, Some((0, 10)), "current cell clamps to the top row");
+        assert!(app.copy_scroll_offset > 0, "handoff at the top edge starts scrolling");
+
+        // Follow-up dwell drags keep scrolling.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 10, -1, true);
+        assert!(app.copy_scroll_offset > o);
+
+        // A second handoff while already in copy mode is ignored.
+        let anchor = app.copy_anchor;
+        super::copy_drag_begin(&mut app, 41, 0, 0, 0, 0, false);
+        assert_eq!(app.copy_anchor, anchor);
     }
 }
 

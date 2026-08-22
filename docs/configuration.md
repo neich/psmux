@@ -385,7 +385,7 @@ set -g pwsh-mouse-selection on
 
 When `pwsh-mouse-selection` is `on`, releasing a left-drag copies the selected text immediately and clears the transient highlight. Right-click copy and `Ctrl+Shift+C` still work as explicit copy actions.
 
-When `scroll-enter-copy-mode` is `off`, scrolling in a pane does not enter copy mode and instead passes scroll events directly to the running application.
+When `scroll-enter-copy-mode` is `off`, scrolling in a pane does not enter copy mode and instead passes scroll events directly to the running application. A drag selection made over such a scrolled-back view still converts to a copy-mode selection when it reaches the pane's top or bottom row, and keeps auto-scrolling in that direction — so text taller than the window can be selected in one gesture (see [features.md](features.md)).
 
 #### Disabling psmux's drag selection (`mouse-selection`)
 

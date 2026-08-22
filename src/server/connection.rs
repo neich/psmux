@@ -1361,6 +1361,21 @@ match cmd {
             }
         }
     }
+    "copy-drag-begin" => {
+        // copy-drag-begin PANE_ID ANCHOR_COL ANCHOR_ROW CUR_COL CUR_ROW [b]
+        // Sent when a normal-mode drag selection crosses the pane's top edge
+        // — or its bottom edge over a direct-scrolled view (#193); the
+        // trailing "b" marks a rectangular (block) selection.
+        if args.len() >= 5 {
+            if let (Ok(pane_id), Ok(a_col), Ok(a_row), Ok(c_col), Ok(c_row)) = (
+                args[0].parse::<usize>(), args[1].parse::<i16>(), args[2].parse::<i16>(),
+                args[3].parse::<i16>(), args[4].parse::<i16>()
+            ) {
+                let rect_sel = args.get(5).map_or(false, |a| *a == "b");
+                let _ = tx.send(CtrlReq::CopyDragBegin(client_id, pane_id, a_col, a_row, c_col, c_row, rect_sel));
+            }
+        }
+    }
     "pane-scroll" => {
         // pane-scroll PANE_ID up|down [COL ROW]
         // COL/ROW are the pointer's pane-relative 0-based position.  They are

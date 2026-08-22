@@ -1541,6 +1541,14 @@ pub enum CtrlReq {
     /// clients send `pane-scroll PANE up|down` with no coordinates; when it is
     /// absent the server falls back to the pane centre.
     PaneScroll(u64, usize, bool, Option<(i16, i16)>),
+    /// Hand a normal-mode client-side drag selection off to server-side copy
+    /// mode because the pointer crossed the pane's top edge — or, when the
+    /// view is direct-scrolled (scroll-enter-copy-mode off, #193), its
+    /// bottom edge (the selection must continue into scrollback).
+    /// Fields: client_id, pane_id,
+    /// anchor col, anchor row, current col, current row (pane-relative
+    /// 0-based, may be out of range), rect (block) selection flag.
+    CopyDragBegin(u64, usize, i16, i16, i16, i16, bool),
     /// Client-side semantic split resize: set sizes at a tree path.
     /// Fields: client_id, path, new sizes
     SplitSetSizes(u64, Vec<usize>, Vec<u16>),

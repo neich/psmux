@@ -16,9 +16,20 @@ pub fn emit_osc52<W: Write>(writer: &mut W, text: &str) {
     let _ = writer.flush();
 }
 
-pub fn enter_copy_mode(app: &mut AppState) { 
-    app.mode = Mode::CopyMode; 
-    app.copy_scroll_offset = 0;
+pub fn enter_copy_mode(app: &mut AppState) {
+    app.mode = Mode::CopyMode;
+    // Start at the view currently on screen: with a direct-scrolled pane
+    // (scroll-enter-copy-mode off, #193) the parser's scrollback is nonzero
+    // while no copy state exists yet, and copy mode must keep that view —
+    // an offset of 0 here would render live content but yank against the
+    // scrolled rows.  At the live bottom this is the usual 0.  Every later
+    // path keeps the two in sync (scroll_copy_up/down, exit_copy_mode).
+    app.copy_scroll_offset = {
+        let win = &app.windows[app.active_idx];
+        active_pane(&win.root, &win.active_path)
+            .and_then(|p| p.term.lock().ok().map(|t| t.screen().scrollback()))
+            .unwrap_or(0)
+    };
     app.copy_selection_mode = crate::types::SelectionMode::Char;
     app.copy_anchor = None;
     // Initialize copy_pos from the terminal cursor so the cursor is

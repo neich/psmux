@@ -160,6 +160,13 @@ pub enum LayoutJson {
         active: bool,
         copy_mode: bool,
         scroll_offset: usize,
+        /// The pane parser's live scrollback offset.  Nonzero whenever the
+        /// view is scrolled back — including DIRECT scrollback with
+        /// scroll-enter-copy-mode off (#193), where copy_mode stays false.
+        /// The client uses it to decide whether a drag selection crossing a
+        /// pane edge has scrollback content to continue into.
+        #[serde(default)]
+        view_offset: usize,
         sel_start_row: Option<u16>,
         sel_start_col: Option<u16>,
         sel_end_row: Option<u16>,
@@ -319,6 +326,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             cursor_shape: 0,
                             active: *cur_path == active_path, copy_mode: false,
                             scroll_offset: 0,
+                            view_offset: 0,
                             sel_start_row: None, sel_start_col: None,
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
@@ -340,6 +348,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                         cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                         active: *cur_path == active_path, copy_mode: false,
                         scroll_offset: 0,
+                        view_offset: 0,
                         sel_start_row: None, sel_start_col: None,
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
@@ -516,6 +525,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     active: false,
                     copy_mode: false,
                     scroll_offset: 0,
+                    view_offset: screen.scrollback(),
                     sel_start_row: None,
                     sel_start_col: None,
                     sel_end_row: None,
@@ -750,6 +760,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"cursor_shape\":0,",
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
+                                "\"view_offset\":0,",
                                 "\"rows_v2\":[],\"content\":[],\"title\":null}}"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
@@ -774,6 +785,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     cr: u16, cc: u16, alt: bool,
                     wants_mouse: bool,
                     hide_cursor: bool,
+                    view_offset: usize,
                     rows_v2: Vec<RowSnap>,
                     content: Vec<Vec<CopyCell>>,
                 }
@@ -781,11 +793,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 let snap = 'snap: {
                     let parser = match p.term.lock() {
                         Ok(g) => g,
-                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, rows_v2: vec![], content: vec![] },
+                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![] },
                     };
                     let screen = parser.screen();
                     let (cr, cc) = screen.cursor_position();
                     let hide_cursor = screen.hide_cursor();
+                    // Live scrollback offset — nonzero for a direct-scrolled
+                    // view (#193) even though copy_mode stays false.
+                    let view_offset = screen.scrollback();
 
                     // Alternate-screen heuristic
                     let alt = screen.alternate_screen() || {
@@ -903,7 +918,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                     }
 
-                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, rows_v2: snap_rows, content: snap_content }
+                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content }
                 };
                 // ── Parser mutex is now RELEASED ──
                 // All JSON string building below happens without holding the lock,
@@ -922,11 +937,12 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         "\"hide_cursor\":{},",
                         "\"cursor_shape\":{},",
                         "\"active\":{},\"copy_mode\":{},",
-                        "\"scroll_offset\":{},"),
+                        "\"scroll_offset\":{},",
+                        "\"view_offset\":{},"),
                     p.id, p.last_rows, p.last_cols,
                     snap.cr, snap.cc, snap.alt, snap.wants_mouse, snap.hide_cursor,
                     cs,
-                    is_active, need_content, so,
+                    is_active, need_content, so, snap.view_offset,
                 ));
 
                 // selection bounds + copy cursor position

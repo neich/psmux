@@ -516,6 +516,20 @@ fn active_pane_in_copy_mode(layout: &LayoutJson) -> bool {
     }
 }
 
+/// Collect each leaf's live scrollback offset (`view_offset`) by pane id.
+/// Nonzero outside copy mode means the pane is direct-scrolled
+/// (scroll-enter-copy-mode off, #193) — i.e. there is content below the view.
+fn collect_view_offsets(layout: &LayoutJson, out: &mut Vec<(usize, usize)>) {
+    match layout {
+        LayoutJson::Leaf { id, view_offset, .. } => out.push((*id, *view_offset)),
+        LayoutJson::Split { children, .. } => {
+            for c in children {
+                collect_view_offsets(c, out);
+            }
+        }
+    }
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -978,6 +992,7 @@ pub fn render_layout_json(
             active,
             copy_mode,
             scroll_offset,
+            view_offset: _,
             sel_start_row,
             sel_start_col,
             sel_end_row,
@@ -2051,7 +2066,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
     let mut rsel_end: Option<(u16, u16)> = None;
     let mut rsel_pane_rect: Option<Rect> = None;    // clip bounds of the originating pane
+    let mut rsel_pane_id: Option<usize> = None;     // pane the selection started in
     let mut rsel_dragged = false;
+    // Server-side copy-mode drag tracking.  The pane the drag started in is
+    // remembered so drag/release events keep reaching the server after the
+    // pointer leaves the pane rect (out-of-range rows drive edge
+    // auto-scroll), and a 50ms repeat re-sends the last drag while the
+    // pointer dwells at/past the pane's first or last row so the view keeps
+    // scrolling without mouse movement (tmux drag-scroll parity).
+    let mut copy_drag_pane: Option<(usize, Rect)> = None; // (pane_id, rect at drag start)
+    let mut copy_drag_last: Option<(i16, i16)> = None;    // last pane-relative (col, row) sent
+    let mut copy_drag_repeat_at: Option<Instant> = None;  // next repeat due (armed only at an edge)
+    const COPY_DRAG_REPEAT: Duration = Duration::from_millis(50);
     // A click withheld from a mouse-aware pane while psmux determines whether
     // the gesture is a click or a selection drag: (pane_id, col, row).
     let mut deferred_left_click: Option<(usize, i16, i16)> = None;
@@ -2069,6 +2095,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut client_tab_positions: Vec<(usize, u16, u16)> = Vec::new(); // (window_display_idx, x_start, x_end)
     let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
     let mut client_pane_rects: Vec<(usize, Rect)> = Vec::new();
+    // Per-pane live scrollback offset from the last dump (see view_offset).
+    let mut client_pane_view_offsets: Vec<(usize, usize)> = Vec::new();
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
     let mut client_content_area: Rect = Rect::default();
     // Border status/format from the last draw, for cursor/mouse inner-rect calc.
@@ -3934,6 +3962,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3979,6 +4008,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -4245,9 +4275,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 deferred_left_click = None;
                                                 cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
                                                     pane_id, rel_col, rel_row));
+                                                // Remember the pane so a drag that leaves its
+                                                // rect still reaches the server (edge auto-scroll).
+                                                copy_drag_pane = Some((pane_id, pane_rect));
+                                                copy_drag_last = None;
+                                                copy_drag_repeat_at = None;
                                                 rsel_start = None;
                                                 rsel_end = None;
                                                 rsel_pane_rect = None;
+                                                rsel_pane_id = None;
                                                 rsel_block = false;
                                                 selection_changed = true;
                                             } else {
@@ -4288,6 +4324,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     rsel_start = None;
                                                     rsel_end = None;
                                                     rsel_pane_rect = None;
+                                                    rsel_pane_id = None;
                                                     rsel_block = false;
                                                     rsel_dragged = false;
                                                     selection_changed = true;
@@ -4313,6 +4350,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 } else if client_pwsh_selection {
                                                     rsel_block = me.modifiers.contains(KeyModifiers::ALT);
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
 
@@ -4357,6 +4395,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     rsel_start = Some((me.column, me.row));
                                                     rsel_end = Some((me.column, me.row));
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
                                                 }
@@ -4413,6 +4452,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -4467,39 +4507,113 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     }
                                 } else if rsel_start.is_none() || !client_mouse_selection {
                                     if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                        // Route the drag to the pane it started in (falling
+                                        // back to the pane under the pointer) and send the
+                                        // row UNCLAMPED: an out-of-range row tells the server
+                                        // the pointer crossed a pane edge, which auto-scrolls
+                                        // the copy-mode view (tmux drag-scroll parity).
+                                        if copy_drag_pane.is_none() {
+                                            copy_drag_pane = client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r));
+                                        }
+                                        if let Some((pane_id, pane_rect)) = copy_drag_pane {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                            let rel_row = me.row as i16 - inner.y as i16;
                                             cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n",
                                                 pane_id, rel_col, rel_row));
+                                            copy_drag_last = Some((rel_col, rel_row));
+                                            // Arm the repeat while the pointer dwells on/past
+                                            // the pane's first or last row: the pre-flush tick
+                                            // re-sends this drag every 50ms so the view keeps
+                                            // scrolling without further mouse movement.
+                                            let at_edge = rel_row <= 0
+                                                || rel_row >= inner.height.saturating_sub(1) as i16;
+                                            copy_drag_repeat_at = if at_edge {
+                                                Some(Instant::now() + COPY_DRAG_REPEAT)
+                                            } else {
+                                                None
+                                            };
                                         }
                                     } else {
                                         cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
                                     }
                                 } else {
                                     if let Some(start) = rsel_start {
-                                        let (col, row) = if client_pwsh_selection {
-                                            if let Some(r) = rsel_pane_rect {
-                                                (
-                                                    me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
-                                                    me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
-                                                )
+                                        // tmux parity: a real drag reaching the pane's top
+                                        // row has run out of visible screen — hand the
+                                        // selection off to server-side copy mode so it
+                                        // continues into scrollback (with edge auto-scroll
+                                        // from here on).  The bottom row does the same, but
+                                        // only when the view is scrolled back (direct
+                                        // scrollback with scroll-enter-copy-mode off, #193)
+                                        // — at the live bottom there is nothing below to
+                                        // select.  Same-cell micro-jitter is excluded so a
+                                        // sloppy click on an edge row stays a click (#199
+                                        // parity).
+                                        let handoff = rsel_pane_rect.zip(rsel_pane_id)
+                                            .and_then(|(pane_rect, pane_id)| {
+                                                let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                                let moved = rsel_dragged || (me.column, me.row) != start;
+                                                let at_top = me.row <= inner.y;
+                                                let scrolled_back = client_pane_view_offsets.iter()
+                                                    .find(|(id, _)| *id == pane_id)
+                                                    .map_or(false, |(_, off)| *off > 0);
+                                                let at_bottom = scrolled_back
+                                                    && me.row >= inner.y + inner.height.saturating_sub(1);
+                                                ((at_top || at_bottom) && moved)
+                                                    .then_some((pane_rect, pane_id, inner))
+                                            });
+                                        if let Some((pane_rect, pane_id, inner)) = handoff {
+                                            let a_col = start.0 as i16 - pane_rect.x as i16;
+                                            let a_row = start.1 as i16 - inner.y as i16;
+                                            let cur_col = me.column as i16 - pane_rect.x as i16;
+                                            let cur_row = me.row as i16 - inner.y as i16;
+                                            cmd_batch.push(format!("copy-drag-begin {} {} {} {} {}{}\n",
+                                                pane_id, a_col, a_row, cur_col, cur_row,
+                                                if rsel_block { " b" } else { "" }));
+                                            // The gesture is definitively a selection drag,
+                                            // not a click — never replay a withheld press
+                                            // (mouse-selection-force) on release.
+                                            deferred_left_click = None;
+                                            // The server is in copy mode from here on; keep
+                                            // the local flag in sync until the next dump
+                                            // confirms it so follow-up drags take the
+                                            // copy-mode path above.
+                                            client_copy_mode = true;
+                                            copy_drag_pane = Some((pane_id, pane_rect));
+                                            copy_drag_last = Some((cur_col, cur_row));
+                                            copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                                            rsel_start = None;
+                                            rsel_end = None;
+                                            rsel_pane_rect = None;
+                                            rsel_pane_id = None;
+                                            rsel_block = false;
+                                            rsel_dragged = false;
+                                            selection_changed = true;
+                                        } else {
+                                            let (col, row) = if client_pwsh_selection {
+                                                if let Some(r) = rsel_pane_rect {
+                                                    (
+                                                        me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
+                                                        me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
+                                                    )
+                                                } else {
+                                                    (me.column, me.row)
+                                                }
                                             } else {
                                                 (me.column, me.row)
+                                            };
+                                            // Ignore micro-drags that stay on the
+                                            // initial click cell (#199 parity).
+                                            if (col, row) == start && !rsel_dragged {
+                                                // no-op
+                                            } else {
+                                                rsel_end = Some((col, row));
+                                                rsel_dragged = true;
+                                                selection_changed = true;
                                             }
-                                        } else {
-                                            (me.column, me.row)
-                                        };
-                                        // Ignore micro-drags that stay on the
-                                        // initial click cell (#199 parity).
-                                        if (col, row) == start && !rsel_dragged {
-                                            // no-op
-                                        } else {
-                                            rsel_end = Some((col, row));
-                                            rsel_dragged = true;
-                                            selection_changed = true;
                                         }
                                     }
                                 }
@@ -4537,6 +4651,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
@@ -4562,6 +4677,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
@@ -4571,6 +4687,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     selection_changed = true;
                                     if let Some((pane_id, down_col, down_row)) = deferred_left_click.take() {
@@ -4597,11 +4714,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
                                             pane_id, up_col, up_row));
                                     } else if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                        // Send the release to the pane the drag started in,
+                                        // even when the pointer ends outside its rect — the
+                                        // server clamps and finalizes the yank.
+                                        let target = copy_drag_pane.or_else(|| {
+                                            client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r))
+                                        });
+                                        if let Some((pane_id, pane_rect)) = target {
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                            let rel_row = me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16;
                                             cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
                                                 pane_id, rel_col, rel_row));
                                         }
@@ -4609,10 +4732,30 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
                                     }
                                 }
+                                // The drag gesture is over in every branch above.
+                                copy_drag_pane = None;
+                                copy_drag_last = None;
+                                copy_drag_repeat_at = None;
                             }
                             MouseEventKind::Up(MouseButton::Right) => {}
                             MouseEventKind::Up(MouseButton::Middle) => {}
                             MouseEventKind::Moved => {
+                                // A bare motion event means the left button is no longer
+                                // held.  If a copy-mode drag was being tracked, its release
+                                // was swallowed (e.g. it happened outside the terminal
+                                // window): finalize the gesture with a synthetic release so
+                                // the selection yanks, and stop the auto-scroll repeat.
+                                if copy_drag_pane.is_some() {
+                                    if client_copy_mode {
+                                        if let (Some((pane_id, _)), Some((rc, rr))) = (copy_drag_pane, copy_drag_last) {
+                                            cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
+                                                pane_id, rc, rr));
+                                        }
+                                    }
+                                    copy_drag_pane = None;
+                                    copy_drag_last = None;
+                                    copy_drag_repeat_at = None;
+                                }
                                 // Detect border hover for visual preview
                                 let mut new_hover: Option<(u16, String, Rect)> = None;
                                 if !client_zoomed {
@@ -4685,6 +4828,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                     Event::FocusLost => {
                         cmd_batch.push("focus-out\n".into());
+                        // No more mouse events will arrive; don't keep
+                        // auto-scrolling a copy-mode drag on the timer alone.
+                        copy_drag_repeat_at = None;
                     }
                     _ => {}
                 }
@@ -4825,6 +4971,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             #[cfg(windows)]
             if ime_was_open { crate::platform::ime_restore(); ime_was_open = false; }
             cmd_batch.push("prefix-end\n".into());
+        }
+
+        // ── Copy-mode drag auto-scroll repeat ──────────────────────────
+        // While the left button is held with the pointer dwelling at/past
+        // the top or bottom row of the copy-mode pane, re-send the last drag
+        // position every 50ms so the server keeps scrolling the view (tmux
+        // repeats its drag timer at the same cadence).  The state clears on
+        // mouse-up / bare motion / focus loss; gating on client_copy_mode
+        // also pauses the repeat harmlessly if a stale dump briefly flips
+        // the flag right after a normal-mode handoff.
+        if client_copy_mode {
+            if let (Some((pane_id, _)), Some((rc, rr)), Some(due)) =
+                (copy_drag_pane, copy_drag_last, copy_drag_repeat_at)
+            {
+                if Instant::now() >= due {
+                    cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n", pane_id, rc, rr));
+                    copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                }
+            }
         }
 
         // Send all batched commands immediately — keys reach the server
@@ -5180,6 +5345,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             client_content_area = content_chunk;
             client_pane_rects.clear();
             collect_pane_rects(&root, content_chunk, &mut client_pane_rects);
+            client_pane_view_offsets.clear();
+            collect_view_offsets(&root, &mut client_pane_view_offsets);
             client_borders.clear();
             let mut border_path = Vec::new();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);

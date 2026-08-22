@@ -4185,7 +4185,8 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             // mouse-* - forward raw mouse events to the server (debug / testing aid)
-            "mouse-down" | "mouse-drag" | "mouse-up" | "mouse-down-right" | "mouse-up-right" => {
+            "mouse-down" | "mouse-drag" | "mouse-up" | "mouse-down-right" | "mouse-up-right"
+            | "pane-mouse" | "pane-scroll" | "copy-drag-begin" => {
                 let parts: Vec<String> = cmd_args.iter().map(|s| s.to_string()).collect();
                 send_control(format!("{}\n", parts.join(" ")))?;
                 return Ok(());

@@ -29,6 +29,7 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         active,
         copy_mode: false,
         scroll_offset: 0,
+        view_offset: 0,
         sel_start_row: None,
         sel_start_col: None,
         sel_end_row: None,

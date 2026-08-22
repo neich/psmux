@@ -29,6 +29,7 @@
 - **Click** status-bar tabs to switch windows
 - **Scroll wheel** in any pane, scrolls that pane's output (configurable via `scroll-enter-copy-mode`)
 - **Drag-select** text to copy to clipboard
+- **Drag auto-scroll** : dragging a selection past the top of a pane continues it into scrollback via copy mode, and holding the pointer at/past the pane's first or last row keeps scrolling (tmux parity) — so output taller than the window can be selected in one gesture. With `scroll-enter-copy-mode off`, a selection made over a direct-scrolled view also continues past the bottom edge, back toward the live output
 - **Right-click** to paste or copy selection
 - **tmux-like release copy selection** : pane-clipped drag copy on left-button release with word/line multi-click (`pwsh-mouse-selection on`)
 - **Disable client-side selection** : let in-pane TUI apps (opencode, lazygit, etc.) handle their own mouse selection (`mouse-selection off`)
@@ -54,7 +55,7 @@
 - `/` and `?` search with `n`/`N` navigation
 - `f`/`F`/`t`/`T` character find, `%` bracket matching, `{`/`}` paragraph jump
 - Named registers (`"a` through `"z`), count prefixes, word/WORD variants
-- Mouse drag-select copies to Windows clipboard on release
+- Mouse drag-select copies to Windows clipboard on release and returns to the live view (tmux parity); dragging at the pane's first/last row auto-scrolls through scrollback
 - **Line numbers** : `set -g copy-mode-line-numbers relative` adds a left gutter, with `off`, `default`, `absolute`, `relative`, and `hybrid` modes and independent styling through `copy-mode-line-number-style` and `copy-mode-current-line-number-style`. See [configuration.md](configuration.md)
 
 See [keybindings.md](keybindings.md) for the full copy mode key reference.
