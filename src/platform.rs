@@ -6034,6 +6034,246 @@ pub mod caret {
     pub fn destroy() {}
 }
 
+/// Ctrl+Wheel font zoom for the hosting Windows Terminal.
+///
+/// While an app has VT mouse reporting on, Windows Terminal sends Ctrl+Wheel
+/// to the app as a mouse event instead of zooming (`_canSendVTMouseInput` only
+/// lets Shift bypass it), and psmux always has mouse reporting on.  There is no
+/// VT sequence that changes the font size, so the zoom is handed back as the
+/// key Windows Terminal binds to the same action by default:
+///
+/// ```text
+///   { "keys": "ctrl+numpad_plus",  "id": "Terminal.IncreaseFontSize" }   delta  1
+///   { "keys": "ctrl+numpad_minus", "id": "Terminal.DecreaseFontSize" }   delta -1
+/// ```
+///
+/// Its own wheel zoom also moves the size by 1 per notch.  The numpad keys are
+/// used instead of `ctrl+plus` / `ctrl+minus` because their virtual keys do not
+/// depend on the keyboard layout.
+pub mod terminal_zoom {
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+    /// The zoom a wheel event asks for: `Some(true)` in, `Some(false)` out,
+    /// `None` for every event that keeps its old meaning.  Only a wheel notch
+    /// with exactly Ctrl held counts: Ctrl+Alt is also how AltGr arrives, and
+    /// Ctrl+Shift is Windows Terminal's opacity gesture, so both stay scrolls.
+    pub fn wheel_zoom_direction(me: &MouseEvent) -> Option<bool> {
+        if me.modifiers != KeyModifiers::CONTROL {
+            return None;
+        }
+        match me.kind {
+            MouseEventKind::ScrollUp => Some(true),
+            MouseEventKind::ScrollDown => Some(false),
+            _ => None,
+        }
+    }
+
+    pub use imp::request;
+
+    /// The `settings.json` of the Windows Terminal running from `exe`: a
+    /// portable install keeps it beside the executable, the Store and Preview
+    /// packages in their package folder, and an unpackaged install under
+    /// `%LOCALAPPDATA%\Microsoft\Windows Terminal`.
+    pub fn wt_settings_path(exe: &std::path::Path, local_app_data: &std::path::Path) -> std::path::PathBuf {
+        let dir = exe.parent().unwrap_or(exe);
+        if dir.join(".portable").exists() {
+            return dir.join("settings").join("settings.json");
+        }
+        let exe_lower = exe.to_string_lossy().to_ascii_lowercase();
+        let package = if exe_lower.contains("\\microsoft.windowsterminalpreview_") {
+            Some("Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe")
+        } else if exe_lower.contains("\\microsoft.windowsterminal_") {
+            Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
+        } else {
+            None
+        };
+        match package {
+            Some(p) => local_app_data.join("Packages").join(p).join("LocalState").join("settings.json"),
+            None => local_app_data.join("Microsoft").join("Windows Terminal").join("settings.json"),
+        }
+    }
+
+    /// Whether a Windows Terminal `settings.json` turns Ctrl+Wheel zoom on.
+    /// Only an explicit `"experimental.scrollToZoom": true` counts; a missing
+    /// key keeps the wheel scrolling.  The file is JSON with comments, so
+    /// comments outside strings are dropped before looking for the key.
+    pub fn scroll_to_zoom_enabled(settings: &str) -> bool {
+        let mut text = String::with_capacity(settings.len());
+        let mut chars = settings.chars().peekable();
+        let mut in_str = false;
+        while let Some(c) = chars.next() {
+            if in_str {
+                text.push(c);
+                if c == '\\' {
+                    if let Some(n) = chars.next() { text.push(n); }
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '/' && chars.peek() == Some(&'/') {
+                while chars.peek().map_or(false, |&n| n != '\n') {
+                    chars.next();
+                }
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' { break; }
+                    prev = n;
+                }
+                text.push(' ');
+            } else {
+                if c == '"' { in_str = true; }
+                text.push(c);
+            }
+        }
+        const KEY: &str = "\"experimental.scrollToZoom\"";
+        let mut on = false;
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find(KEY) {
+            rest = &rest[i + KEY.len()..];
+            if let Some(v) = rest.trim_start().strip_prefix(':') {
+                // The last occurrence wins, as for a repeated JSON key.
+                on = v.trim_start().starts_with("true");
+            }
+        }
+        on
+    }
+
+    #[cfg(not(windows))]
+    mod imp {
+        pub fn request(_zoom_in: bool) -> bool { false }
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetForegroundWindow() -> isize;
+            fn GetClassNameW(hWnd: isize, lpClassName: *mut u16, nMaxCount: i32) -> i32;
+            fn GetAncestor(hwnd: isize, gaFlags: u32) -> isize;
+            fn GetAsyncKeyState(vKey: i32) -> i16;
+            fn MapVirtualKeyW(uCode: u32, uMapType: u32) -> u32;
+            fn keybd_event(bVk: u8, bScan: u8, dwFlags: u32, dwExtraInfo: usize);
+            fn GetWindowThreadProcessId(hWnd: isize, lpdwProcessId: *mut u32) -> u32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetConsoleWindow() -> isize;
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+            fn QueryFullProcessImageNameW(hProcess: isize, dwFlags: u32, lpExeName: *mut u16, lpdwSize: *mut u32) -> i32;
+            fn CloseHandle(hObject: isize) -> i32;
+        }
+
+        const WT_WINDOW_CLASS: &str = "CASCADIA_HOSTING_WINDOW_CLASS";
+        const GA_ROOTOWNER: u32 = 3;
+        const KEYEVENTF_KEYUP: u32 = 0x0002;
+        const VK_CONTROL: u8 = 0x11;
+        const VK_ADD: u8 = 0x6B;
+        const VK_SUBTRACT: u8 = 0x6D;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+        /// Whether the foreground window is the Windows Terminal hosting this
+        /// client.  The pseudo console window is owned by its terminal window on
+        /// current Windows Terminal builds; when that link is missing, any
+        /// foreground Windows Terminal window is accepted.  Returns that window.
+        fn hosting_terminal_foreground() -> Option<isize> {
+            // A client reached over SSH must never type into the local desktop.
+            if std::env::var_os("WT_SESSION").is_none()
+                || std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_CLIENT").is_some()
+            {
+                return None;
+            }
+            unsafe {
+                let fg = GetForegroundWindow();
+                if fg == 0 {
+                    return None;
+                }
+                let mut buf = [0u16; 64];
+                let n = GetClassNameW(fg, buf.as_mut_ptr(), buf.len() as i32);
+                if n <= 0 || String::from_utf16_lossy(&buf[..n as usize]) != WT_WINDOW_CLASS {
+                    return None;
+                }
+                let console = GetConsoleWindow();
+                if console != 0 {
+                    let owner = GetAncestor(console, GA_ROOTOWNER);
+                    if owner != 0 && owner != console && owner != fg {
+                        return None;
+                    }
+                }
+                Some(fg)
+            }
+        }
+
+        /// Full path of the executable that owns `hwnd`.
+        fn window_exe(hwnd: isize) -> Option<std::path::PathBuf> {
+            unsafe {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == 0 {
+                    return None;
+                }
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if h == 0 {
+                    return None;
+                }
+                let mut buf = [0u16; 1024];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+                CloseHandle(h);
+                if ok == 0 {
+                    return None;
+                }
+                Some(String::from_utf16_lossy(&buf[..len as usize]).into())
+            }
+        }
+
+        /// Whether the Windows Terminal that owns `hwnd` has its Ctrl+Wheel
+        /// zoom option (`experimental.scrollToZoom`) turned on.  Read on every
+        /// notch, so toggling it in the settings applies without a restart.
+        fn scroll_to_zoom_on(hwnd: isize) -> bool {
+            let Some(exe) = window_exe(hwnd) else { return false };
+            let Some(local) = std::env::var_os("LOCALAPPDATA") else { return false };
+            let path = super::wt_settings_path(&exe, std::path::Path::new(&local));
+            std::fs::read_to_string(path)
+                .map_or(false, |text| super::scroll_to_zoom_enabled(&text))
+        }
+
+        fn tap(vk: u8, up: bool) {
+            unsafe {
+                let scan = MapVirtualKeyW(vk as u32, 0) as u8;
+                keybd_event(vk, scan, if up { KEYEVENTF_KEYUP } else { 0 }, 0);
+            }
+        }
+
+        /// Ask the hosting Windows Terminal to zoom in or out by one step.
+        /// Returns false, sending nothing, when the client is not running in the
+        /// foreground Windows Terminal window or that terminal does not have
+        /// Ctrl+Wheel zoom turned on, so the caller keeps treating the wheel as
+        /// a scroll.
+        pub fn request(zoom_in: bool) -> bool {
+            let Some(fg) = hosting_terminal_foreground() else { return false };
+            if !scroll_to_zoom_on(fg) {
+                return false;
+            }
+            let vk = if zoom_in { VK_ADD } else { VK_SUBTRACT };
+            // The wheel event carried Ctrl, but it may be released by now; press
+            // it only in that case, or releasing it would cut the user's Ctrl hold
+            // and turn the next notch into a plain scroll.
+            let ctrl_held = unsafe { GetAsyncKeyState(VK_CONTROL as i32) } < 0;
+            if !ctrl_held { tap(VK_CONTROL, false); }
+            tap(vk, false);
+            tap(vk, true);
+            if !ctrl_held { tap(VK_CONTROL, true); }
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_ctrl_wheel_zoom.rs"]
+mod tests_ctrl_wheel_zoom;
+
 /// Last-resort modifier recovery for Enter on terminals that cannot encode one.
 ///
 /// VT has no encoding for a modified Return, so a terminal that has nothing

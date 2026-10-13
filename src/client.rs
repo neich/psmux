@@ -6471,6 +6471,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
+                        // Ctrl+Wheel zooms the terminal font, not the pane.
+                        // Windows Terminal hands it to us because mouse
+                        // reporting is on; give it back as its zoom key.
+                        // Anything else, or no foreground Windows Terminal,
+                        // falls through unchanged.
+                        if crate::platform::terminal_zoom::wheel_zoom_direction(&me)
+                            .map_or(false, crate::platform::terminal_zoom::request)
+                        {
+                            _pending_evt = input.try_read()?;
+                            continue;
+                        }
                         // Intercept mouse events while a draggable picker is open
                         // so the user can move the popup by dragging its border
                         // and so clicks behind the popup don't leak through to
