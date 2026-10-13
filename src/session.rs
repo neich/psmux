@@ -1175,7 +1175,10 @@ pub fn kill_servers_in_scope(
                         let _ = stream.flush();
                         let _ = stream.shutdown(std::net::Shutdown::Write);
                         // Wait for the server to exit (EOF = done).
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+                        // Longer than the server's own hold (KILL_SERVER_HOLD),
+                        // so the EOF that ends this wait is the server exiting
+                        // after its reaper, not this timeout (#686).
+                        let _ = stream.set_read_timeout(Some(crate::warm_pane_sync::KILL_SERVER_HOLD + Duration::from_millis(1000)));
                         let mut buf = [0u8; 64];
                         loop {
                             match std::io::Read::read(&mut stream, &mut buf) {
@@ -2498,6 +2501,150 @@ pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
 ///
 /// Used when a probe proves the session is dead. Safe against a live server:
 /// it re-creates these files on its next 5s registry tick.
+/// The file name a registry path is actually stored under, or `None` when
+/// nothing is there.
+///
+/// The data directory is case-insensitive on Windows, so opening
+/// `REPRO-CASE.port` succeeds on a file created as `repro-case.port`. The
+/// directory entry still remembers the spelling it was created with, and that
+/// spelling is the stored session name (issue #774). `FindFirstFileW` on a path
+/// without wildcards is a single lookup that returns that entry's real name.
+#[cfg(windows)]
+pub fn stored_file_name(path: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    if path.contains(['*', '?']) {
+        return None;
+    }
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let h = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe { FindClose(h) };
+    let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+    Some(String::from_utf16_lossy(&data.cFileName[..len]))
+}
+
+#[cfg(not(windows))]
+pub fn stored_file_name(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.exists() {
+        p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Is `stored` a different spelling of the requested registry base `base`?
+///
+/// tmux compares session names with `strcmp` (`session_find`, and the prefix
+/// and `fnmatch` fallbacks in `cmd_find_get_session` are case-sensitive too),
+/// so a session name that differs only in case is a different session. The
+/// `-L` namespace part of a base (`<ns>__`) is not part of the session name and
+/// is left out of the comparison: only the session name is held to tmux's rule.
+pub fn session_spelling_differs(base: &str, stored: &str) -> bool {
+    if base == stored {
+        return false;
+    }
+    match (base.split_once("__"), stored.split_once("__")) {
+        (Some((_, b)), Some((_, s))) => b != s,
+        _ => true,
+    }
+}
+
+/// The stored name of the live registry entry that a lookup of `base` lands on
+/// when it is spelled differently, or `None` when there is no entry or the
+/// spelling is exact (issue #774).
+///
+/// Every registry lookup opens `<base>.port`, which on a case-insensitive data
+/// directory finds a session whose name differs only in case. Callers resolving
+/// an explicit session target must treat `Some` as "no such session".
+pub fn registry_case_variant(base: &str) -> Option<String> {
+    let path = crate::paths::port_file_opt(base)?;
+    let stored = stored_file_name(&path)?;
+    let stem = stored.strip_suffix(".port").or_else(|| {
+        // The extension itself is stored as created; compare it loosely.
+        let n = stored.len().checked_sub(5)?;
+        stored.get(n..).filter(|e| e.eq_ignore_ascii_case(".port")).map(|_| &stored[..n])
+    })?;
+    if session_spelling_differs(base, stem) {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+/// The live session that would be overwritten if the session registered as
+/// `current_base` were renamed to `new_base`, by its stored registry base.
+///
+/// tmux refuses `rename-session` onto an existing name with `duplicate
+/// session: NAME` (`cmd-rename-session.c`). psmux had no such check: the rename
+/// wrote its files over the other session's, orphaning a live server. On the
+/// case-insensitive data directory the same happens for a name that differs
+/// only in case (issue #774), so the slot is checked by its stored spelling.
+/// Renaming a session to another spelling of its own name lands on its own
+/// files and is allowed, as in tmux.
+pub fn rename_blocker(current_base: &str, new_base: &str) -> Option<String> {
+    if new_base == current_base {
+        return None;
+    }
+    let path = crate::paths::port_file_opt(new_base)?;
+    let stored = stored_file_name(&path)?;
+    let n = stored.len().checked_sub(5)?;
+    let stem = stored.get(..n)?.to_string();
+    if stem == current_base {
+        return None;
+    }
+    let alive = match registry_pid_anchor_alive(new_base) {
+        Some(v) => v,
+        None => std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .map(|port| {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+            })
+            .unwrap_or(false),
+    };
+    if alive { Some(stem) } else { None }
+}
+
+/// The user-facing session name of a registry base: the `<ns>__` prefix of
+/// `-L ns` removed.
+pub fn display_session_name<'a>(ns: Option<&str>, base: &'a str) -> &'a str {
+    match ns {
+        Some(n) if !n.is_empty() => base.strip_prefix(&format!("{}__", n)).unwrap_or(base),
+        _ => base,
+    }
+}
+
+/// Make the registry files of `base` carry exactly that spelling (issue #774).
+///
+/// `std::fs::write` over an existing file keeps the old directory entry, so a
+/// file left behind by a session spelled differently would keep its spelling
+/// under a new server and the case-exact lookup would then miss the session
+/// that owns it. A case-only rename fixes the entry in place.
+pub fn heal_registry_spelling(base: &str) {
+    for path in [
+        crate::paths::port_file(base),
+        crate::paths::key_file(base),
+        crate::paths::sid_file(base),
+        crate::paths::pid_file(base),
+    ] {
+        let Some(stored) = stored_file_name(&path) else { continue };
+        let wanted = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        if wanted.as_deref() != Some(stored.as_str()) {
+            let from = Path::new(&path).with_file_name(&stored);
+            let _ = std::fs::rename(&from, &path);
+        }
+    }
+}
+
 pub fn remove_session_registry(base: &str) {
     let Some(port_path) = crate::paths::port_file_opt(base) else {
         return;
@@ -2565,6 +2712,23 @@ pub fn send_control(line: String) -> io::Result<()> {
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
+    send_control_with_response_bounded(line, Some(Duration::from_millis(3000)))
+}
+
+/// [`send_control_with_response`] for a command whose reply comes only once
+/// the work it starts has finished: a forwarded `if-shell` (a shell condition,
+/// then the chosen branch, which may create a session), a forwarded
+/// `run-shell`, and `source-file`. A tmux client waits for its command list
+/// however long it runs (client.c leaves only on the server's MSG_EXIT). The
+/// 3 s read bound made a slow condition or session creation look like no
+/// answer, and the CLI then ran the command a SECOND time locally while the
+/// server was still running the first: a duplicate session, a run-shell body
+/// run twice (#734 follow up). The connect stays bounded.
+pub fn send_control_with_response_wait(line: String) -> io::Result<String> {
+    send_control_with_response_bounded(line, None)
+}
+
+fn send_control_with_response_bounded(line: String, read_timeout: Option<Duration>) -> io::Result<String> {
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
@@ -2589,7 +2753,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+    let _ = stream.set_read_timeout(read_timeout);
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
@@ -3186,3 +3350,7 @@ mod tests_issue698_counter_lock_missing_dir;
 #[cfg(test)]
 #[path = "../tests-rs/test_namespaced_session_identity.rs"]
 mod tests_namespaced_session_identity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue774_session_name_case.rs"]
+mod tests_issue774_session_name_case;

@@ -333,6 +333,43 @@ pub fn flag_takes_value(command: &str, flag: char) -> bool {
     kind != FlagValue::None
 }
 
+/// Split clustered short flags into one token per flag, as tmux's getopt
+/// reads them: `-dt %1` becomes `-d -t %1`, and `-t%1` becomes `-t %1`.
+///
+/// For the client arms that rebuild a command line from exact tokens
+/// (`select-pane`, `last-pane`), which otherwise drop a cluster without a word
+/// (`select-pane -dt %2` reached the server as a bare `select-pane`).  A
+/// value-taking flag ends its cluster and takes the rest of the word or the
+/// next argument; `--` and the first non-option end the flags, and what follows
+/// is passed through untouched.  Only for commands whose templates have no
+/// OPTIONAL (`::`) values, which both callers satisfy.
+pub fn expand_flag_clusters<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_ref();
+        if a == "--" || !a.starts_with('-') || a.len() < 2 {
+            out.extend(args[i..].iter().map(|s| s.as_ref().to_string()));
+            break;
+        }
+        for (pos, c) in a.char_indices().skip(1) {
+            out.push(format!("-{}", c));
+            if flag_takes_value(command, c) {
+                let rest = &a[pos + c.len_utf8()..];
+                if !rest.is_empty() {
+                    out.push(rest.to_string());
+                } else if let Some(v) = args.get(i + 1) {
+                    out.push(v.as_ref().to_string());
+                    i += 1;
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Normalize `-x=VALUE` short-flag forms into `["-x", "VALUE"]`.
 ///
 /// tmux accepts both `-t VALUE` (space) and `-t=VALUE` (equals) for
@@ -488,7 +525,7 @@ pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
 
 pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Option<usize> {
     let value_options: &[&str] = match command {
-        "bind-key" | "bind" => &["-T"],
+        "bind-key" | "bind" => &["-T", "-N"],
         "set-hook" => &["-t"],
         "confirm-before" | "confirm" => &["-p", "-t"],
         _ => return None,
@@ -567,6 +604,180 @@ pub fn split_command_queue<S: AsRef<str>>(args: &[S]) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+/// Split a one-shot CLI command list (`argv` from the command name on) into
+/// its first command and the commands after it, or `None` when the argv is to
+/// be dispatched whole, exactly as before command lists were recognised.
+///
+/// tmux runs `tmux cmd1 \; cmd2` as one command list. psmux's CLI dispatches
+/// on the FIRST command's name, and most of those arms rebuild the request
+/// from the flags they know, so everything after the separator was silently
+/// dropped (`select-pane -t p \; set-option ...` never set the option) or read
+/// as the first command's own arguments. The caller sends the whole list to
+/// the server as one line instead (see [`command_list_wire_line`]).
+///
+/// Only a lone `;` or `\;` argument separates, the same whole-token rule
+/// [`crate::config::split_chained_commands_pub`] applies to the line the
+/// server reads; an argument that merely ends in `;` stays data, as it always
+/// has on this route. Commands that hand their arguments, separators and
+/// all, to the server's own splitter (`bind-key`, `set-hook` and the
+/// prompts), that run their own queue (`start-server`, #734), or that never
+/// hand control back (an attaching client) keep their whole argv.
+/// `new-session`, `run-shell` and `if-shell` are split: the caller runs them
+/// through their own arm first (see [`command_list_runs_alone`]).
+pub fn split_cli_command_list<S: AsRef<str>>(
+    argv: &[S],
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let command = argv.first()?.as_ref();
+    let keeps_whole_line = matches!(
+        command,
+        // The server splits these lines itself, as it always has.
+        "bind-key" | "bind" | "set-hook" | "confirm-before" | "confirm"
+        | "command-prompt" | "display-menu" | "menu"
+        // Runs its own queue against the server it starts (#734).
+        | "start-server" | "start" | "warmup"
+        // An attaching client does not come back until it detaches.
+        | "attach-session" | "attach" | "at" | "a" | "server"
+    );
+    if keeps_whole_line {
+        return None;
+    }
+    let mut groups: Vec<Vec<String>> = vec![Vec::new()];
+    for arg in argv {
+        let arg = arg.as_ref();
+        if arg == ";" || arg == "\\;" {
+            groups.push(Vec::new());
+        } else if let Some(last) = groups.last_mut() {
+            last.push(arg.to_string());
+        }
+    }
+    let mut groups = groups.into_iter();
+    let first = groups.next().unwrap_or_default();
+    let queued: Vec<Vec<String>> = groups.filter(|g| !g.is_empty()).collect();
+    if first.is_empty() || queued.is_empty() {
+        return None;
+    }
+    Some((first, queued))
+}
+
+/// The one line a CLI command list goes to the server as: each command's
+/// arguments quoted where the server's tokenizer needs it (the same
+/// [`crate::util::quote_arg_if_needed`] rule the CLI arms use, so a value such
+/// as `a ; b` stays one quoted argument), commands joined by ` ; `. The
+/// server's connection loop splits it back with
+/// [`crate::config::split_chained_commands_pub`] and runs the commands in
+/// order, stopping at the first that fails.
+pub fn command_list_wire_line(first: &[String], queued: &[Vec<String>]) -> String {
+    std::iter::once(first)
+        .chain(queued.iter().map(Vec::as_slice))
+        .map(|command| {
+            command
+                .iter()
+                .map(|arg| crate::util::quote_arg_if_needed(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+/// Commands of a CLI command list that run as their own invocation of the
+/// CLI rather than on the connection of the session the list is routed to:
+/// their arm does its work on the client or across every server of the
+/// namespace (`list-sessions`, `kill-server`, `has-session`, `kill-session`,
+/// `run-shell`, `if-shell`'s condition), routes in its own way
+/// (`switch-client`, `detach-client`), or creates or attaches a session.
+/// Sent down one session's connection instead, `ls` listed that session
+/// alone and `kill-server` ended only it.
+pub fn command_list_runs_alone(command: &str) -> bool {
+    matches!(
+        command,
+        "list-sessions" | "ls" | "kill-server" | "has-session" | "has"
+        | "kill-session" | "kill-ses" | "run-shell" | "run" | "if-shell" | "if"
+        | "new-session" | "new" | "attach-session" | "attach" | "at" | "a"
+        | "start-server" | "start" | "warmup" | "switch-client" | "switchc"
+        | "detach-client" | "detach" | "server"
+    )
+}
+
+/// The values a command's `-t` and `-s` flags name, spelled apart (`-t x`),
+/// attached (`-tx`) or ending a cluster (`-dt x`). Scanning stops at `--`.
+/// Reading too much is harmless: the caller only uses these to decide that a
+/// command must be routed on its own.
+pub fn command_list_target_values(command: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut i = 1;
+    while i < command.len() {
+        let arg = command[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if let Some(letters) = arg.strip_prefix('-') {
+            if let Some(at) = letters.find(|c| c == 't' || c == 's') {
+                let rest = &letters[at + 1..];
+                if rest.is_empty() {
+                    if let Some(value) = command.get(i + 1) {
+                        values.push(value.clone());
+                    }
+                    i += 1;
+                } else {
+                    values.push(rest.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    values
+}
+
+/// Whether a later command of a CLI command list can go down the same
+/// connection as the commands before it, to the session `routed_base` (a
+/// registry base name) the list is routed to.
+///
+/// psmux runs one server per session, so a command naming another session
+/// sent down this connection acted on THIS one: `set -t x @a 1 \; set -t y
+/// @b 2` set both on x, and `send-keys -t y ...` typed into x. Anything that
+/// names a session other than this one, an id that may live elsewhere
+/// (`%N`, `@N`, `$N`: the CLI resolves their owner, #627), a command outside
+/// the tmux catalog (whose CLI arm decides if it exists), or a command that
+/// runs alone ([`command_list_runs_alone`]) is not shared.
+pub fn command_list_shares_session(command: &[String], ns: Option<&str>, routed_base: &str) -> bool {
+    let Some(name) = command.first() else { return false };
+    if command_list_runs_alone(name) || !crate::server::connection::is_catalog_command(name) {
+        return false;
+    }
+    command_list_target_values(command).iter().all(|value| {
+        let value = value.trim_start_matches('=');
+        if value.is_empty() || value.starts_with(':') || value.starts_with('.') {
+            return true;
+        }
+        if value.starts_with(['%', '@', '$']) {
+            return false;
+        }
+        match parse_target(value).session {
+            Some(session) => crate::session::same_session_identity(ns, &session, routed_base),
+            None => true,
+        }
+    })
+}
+
+/// Split a command list's reply into what its commands printed, verbatim,
+/// and their error messages: a line starting with `ERROR` (`ERROR: msg`, or
+/// switch-client's `ERROR msg`) is a failed command, the server's one-shot
+/// reply convention every CLI arm reads.
+pub fn command_list_reply(reply: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut errors = Vec::new();
+    for line in reply.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("ERROR") {
+            errors.push(rest.strip_prefix(':').unwrap_or(rest).trim().to_string());
+        } else {
+            out.push_str(line);
+        }
+    }
+    (out, errors)
 }
 
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
@@ -1661,3 +1872,7 @@ mod tests_issue692_select_window_targets;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue734_command_queue.rs"]
 mod tests_issue734_command_queue;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_cli_command_list.rs"]
+mod tests_cli_command_list;

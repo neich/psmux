@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "3.3.8"
+version = "3.4.0"
 authors = ["Godwin Sam Josh"]
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
@@ -115,7 +115,7 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.30.2"
 crossterm = "0.29.0"
-portable-pty = { version = "0.9.7", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
+portable-pty = { version = "0.9.8", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
 which = "8.0.6"
 chrono = "0.4.45"
 vt100 = { version = "0.16.13", path = "crates/vt100-psmux", package = "vt100-psmux" }

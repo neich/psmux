@@ -63,6 +63,22 @@ fn run_cli_new_session(args: &[&str]) -> String {
     }
 }
 
+/// What a one-shot detached `new-session` sends back. Alone on its connection
+/// it keeps the historical `OK` for a plain success (raw socket callers read
+/// exactly that). Inside a command list (an `if-shell` branch such as
+/// `new-session -d -s x ; display-message -p done`) that placeholder would be
+/// printed to the user ahead of the next command's output, and tmux prints
+/// nothing for a `new-session -d` without `-P` (cmd-new-session.c prints only
+/// under -P), so it is dropped there. A `-P` report and an `ERROR:` line pass
+/// through either way.
+pub(crate) fn one_shot_new_session_reply(out: String, in_command_list: bool) -> String {
+    if in_command_list && out == "OK\n" {
+        String::new()
+    } else {
+        out
+    }
+}
+
 /// The write side of a client connection: one logical reply, one send.
 ///
 /// The default `Write::write_fmt` hands every piece of a format string to
@@ -77,11 +93,34 @@ fn run_cli_new_session(args: &[&str]) -> String {
 /// `flush` pass straight through. It derefs to the socket for the read only
 /// calls (`set_nodelay`, `shutdown`, `register_persistent_stream`), and
 /// `try_clone` hands back another `ReplyStream` so clones keep the property.
-pub(crate) struct ReplyStream(TcpStream);
+///
+/// The second field records that a formatted reply starting with `ERROR` went
+/// out since [`ReplyStream::take_error`] last looked: the one-shot loop ends a
+/// command list there, as tmux's cmd-queue.c removes the rest of the list
+/// after a command fails. Every command error on this connection is written
+/// with `write!`/`writeln!` as an `ERROR...` line (pane text such as
+/// capture-pane's goes out with `write_all` and is not looked at).
+pub(crate) struct ReplyStream(TcpStream, bool);
 
 impl ReplyStream {
+    fn new(stream: TcpStream) -> ReplyStream {
+        ReplyStream(stream, false)
+    }
+
     fn try_clone(&self) -> io::Result<ReplyStream> {
-        self.0.try_clone().map(ReplyStream)
+        self.0.try_clone().map(ReplyStream::new)
+    }
+
+    /// Whether an error reply was written since the last call, clearing it.
+    fn take_error(&mut self) -> bool {
+        std::mem::take(&mut self.1)
+    }
+
+    fn send_reply(&mut self, text: &str) -> io::Result<()> {
+        if is_error_reply(text) {
+            self.1 = true;
+        }
+        self.0.write_all(text.as_bytes())
     }
 
     /// The underlying socket, for a clone that is only ever shut down.
@@ -108,14 +147,28 @@ impl Write for ReplyStream {
 
     fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
         match args.as_str() {
-            Some(s) => self.0.write_all(s.as_bytes()),
-            None => self.0.write_all(std::fmt::format(args).as_bytes()),
+            Some(s) => self.send_reply(s),
+            None => self.send_reply(&std::fmt::format(args)),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
     }
+}
+
+/// A command's failure reply on a one-shot connection: `ERROR: <message>`, or
+/// `ERROR <message>` as the switch-client handlers answer.
+pub(crate) fn is_error_reply(text: &str) -> bool {
+    text.starts_with("ERROR")
+}
+
+/// Whether `name` is a tmux command or alias in the [`TMUX_COMMANDS`] catalog.
+pub(crate) fn is_catalog_command(name: &str) -> bool {
+    TMUX_COMMANDS.iter().any(|entry| match entry.split_once(" (") {
+        Some((command, alias)) => command == name || alias.trim_end_matches(')') == name,
+        None => *entry == name,
+    })
 }
 
 /// Expand a `set-option -F` value as a format before it is stored.
@@ -144,6 +197,27 @@ fn expand_set_option_value(
     rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(value)
 }
 
+/// Format expand the shell command of if-shell or run-shell before it runs.
+///
+/// tmux expands it unconditionally (cmd-if-shell.c:86
+/// format_single_from_target, cmd-run-shell.c:144 format_expand), against the
+/// command's target, or with no session at all on an empty server, where
+/// server variables such as `#{pid}` still resolve. A command with no `#` in
+/// it expands to itself, so the round trip to the server thread is skipped.
+/// The expansion is untimed: a `%` in a shell command is not strftime.
+fn expand_shell_command(tx: &TargetedSender, cmd: String) -> String {
+    if !cmd.contains('#') {
+        return cmd;
+    }
+    let (rtx, rrx) = mpsc::channel::<String>();
+    if tx.send(CtrlReq::ExpandFormat(cmd.clone(), rtx)).is_err() {
+        return cmd;
+    }
+    // On timeout run the unexpanded text: no worse than not expanding, and
+    // better than dropping the command silently.
+    rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(cmd)
+}
+
 /// The sender a command's handler sends its requests through.  When the
 /// command has a validated -t target, EVERY request it sends goes out as
 /// `CtrlReq::Targeted(target, request)`, so the server applies the target to
@@ -168,6 +242,19 @@ impl<'a> TargetedSender<'a> {
             Some(t) => self.inner.send(CtrlReq::Targeted(t.clone(), Box::new(req))),
             None => self.inner.send(req),
         }
+    }
+
+    /// The validated target this sender wraps requests in, for a request that
+    /// carries its target itself (`CtrlReq::SetPaneInputOff`).
+    pub(crate) fn target(&self) -> Option<&crate::types::TempTarget> {
+        self.target.as_ref()
+    }
+
+    /// Send `req` WITHOUT the temporary-focus wrapper.  Only for a request
+    /// that already carries `target()` inside it.  A send fails only when the
+    /// server loop is gone, and the caller's reply wait then returns at once.
+    pub(crate) fn send_unwrapped(&self, req: CtrlReq) {
+        let _ = self.inner.send(req);
     }
 }
 
@@ -383,6 +470,41 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].to_string())
 }
 
+/// Whether `arg` is a list-keys flag cluster (tmux "1aF:NO:P:rT:") that
+/// carries flag `c`.
+fn list_keys_flag(arg: &str, c: char) -> bool {
+    arg.len() > 1
+        && arg.starts_with('-')
+        && arg != "--"
+        && arg[1..].chars().all(|ch| "1aNr".contains(ch))
+        && arg[1..].contains(c)
+}
+
+/// The table and key of one `bind-key [-r] -T <table> <key> <command>` line.
+fn list_keys_line_table_key(line: &str) -> (Option<&str>, Option<&str>) {
+    let mut it = line.split(' ').skip_while(|t| *t != "-T").skip(1);
+    (it.next(), it.next())
+}
+
+/// `list-keys -N`'s operands: (`-T` table, `-a`, key filter).
+fn list_keys_notes_args(args: &[&str]) -> (Option<String>, bool, Option<String>) {
+    let mut table = None;
+    let mut all = false;
+    let mut key = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-T" => { table = args.get(i + 1).map(|s| s.to_string()); i += 2; continue; }
+            "-F" | "-O" | "-P" | "-t" => { i += 2; continue; }
+            a if list_keys_flag(a, 'a') => all = true,
+            a if a.starts_with('-') && a.len() > 1 => {}
+            a => { if key.is_none() { key = Some(a.to_string()); } }
+        }
+        i += 1;
+    }
+    (table, all, key)
+}
+
 fn requote_command_tail(args: &[&str]) -> String {
     args.iter().map(|t| {
         if t.is_empty() {
@@ -582,6 +704,125 @@ pub(crate) fn select_pane_has_own_operation(args: &[&str], raw_target: Option<&s
         || args.iter().any(|a| {
             matches!(*a, "-U" | "-D" | "-L" | "-R" | "-l" | "-m" | "-M" | "-e" | "-d")
         })
+}
+
+/// `select-pane -e` / `-d` as an input toggle: `Some((off, last))` when this
+/// command sets (`-d`, off true) or clears (`-e`) the target pane's input-off
+/// flag, `last` when `-l` moves that to the window's last pane.
+///
+/// tmux's cmd-select-pane.c tests `-l` first and toggles the LAST pane's
+/// `PANE_INPUTOFF` there when `-e`/`-d` come with it; `-m`/`-M` come next and
+/// return before `-e`/`-d` are looked at, and `-e` is tested before `-d`, so
+/// `-e` wins when both are given.  A toggle also returns before `-T`/`-P`.
+///
+/// None for the forms psmux still runs as a NAVIGATION: a direction or a
+/// relative `:.+`/`:.-` target with `-e`/`-d`.  tmux toggles the pane in that
+/// direction there without selecting it; psmux keeps its long standing
+/// behaviour (it moves) rather than guess, since none of its directional code
+/// can name the neighbour without moving to it.
+///
+/// The flags are read the way tmux's getopt reads `DdegLlMmP:RT:t:UZ`, so a
+/// `-T` title, `-P` style or `-t` target VALUE is never taken for a flag:
+/// `select-pane -T -d` sets the title "-d" and leaves input alone.
+pub(crate) fn select_pane_input_toggle(args: &[&str], raw_target: Option<&str>) -> Option<(bool, bool)> {
+    let flags = select_pane_flags(args);
+    let has = |f: char| flags.contains(&f);
+    let enable = has('e');
+    let disable = has('d');
+    if !enable && !disable {
+        return None;
+    }
+    let last = has('l');
+    if !last {
+        let relative = raw_target.is_some_and(|t| {
+            t.contains(".+") || t.contains(".-") || t == "+" || t == "-"
+        });
+        if relative || ['U', 'D', 'L', 'R', 'm', 'M'].iter().any(|f| has(*f)) {
+            return None;
+        }
+    }
+    Some((!enable, last))
+}
+
+/// `last-pane -e` / `-d`: `Some(off)` when the command toggles the last pane's
+/// input instead of selecting it.  tmux's last-pane runs cmd_select_pane_exec,
+/// whose `-l` branch tests `-e` before `-d` (cmd-select-pane.c:178-186).  Its
+/// template `det:Z` takes a value only for `-t`, which `select_pane_flags`
+/// steps over (`-P`/`-T` never reach here: the flag validator refuses them).
+pub(crate) fn last_pane_input_toggle(args: &[&str]) -> Option<bool> {
+    let flags = select_pane_flags(args);
+    if flags.contains(&'e') {
+        Some(false)
+    } else if flags.contains(&'d') {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The target a `CtrlReq::SetPaneInputOff` carries: the validated one, plus a
+/// `%N` pane id the route deliberately left unvalidated because it may name a
+/// floating pane, which `ValidateTarget` cannot see (`set_pane_input_off`
+/// resolves it, and reports tmux's `can't find pane` for a bad one).
+fn input_toggle_target(
+    validated: Option<&crate::types::TempTarget>,
+    pane: Option<usize>,
+    pane_is_id: bool,
+) -> Option<crate::types::TempTarget> {
+    let mut target = validated.cloned();
+    if let (Some(p), true) = (pane, pane_is_id) {
+        let t = target.get_or_insert_with(Default::default);
+        t.pane = Some(p);
+        t.pane_is_id = true;
+    }
+    target
+}
+
+/// The boolean flags of a `select-pane` argument list, parsed like tmux's
+/// getopt string `DdegLlMmP:RT:t:UZ` (cmd-select-pane.c): flags may be
+/// clustered (`-dt %1`), `-P`, `-T` and `-t` consume the rest of their word
+/// or the next argument as a value, and `--` or the first non-option ends
+/// the options.
+fn select_pane_flags(args: &[&str]) -> Vec<char> {
+    select_pane_getopt(args).0
+}
+
+/// The `-t` value of a `select-pane` / `last-pane` argument list, read by the
+/// same getopt walk as [`select_pane_flags`], so `-dt %1` and `-t%1` name
+/// `%1` and a `-T -t` title is not a target.
+pub(crate) fn select_pane_target_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
+    select_pane_getopt(args).1
+}
+
+fn select_pane_getopt<'a>(args: &[&'a str]) -> (Vec<char>, Option<&'a str>) {
+    let mut flags = Vec::new();
+    let mut target = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" || !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for (pos, c) in a.char_indices().skip(1) {
+            if matches!(c, 'P' | 'T' | 't') {
+                // The value is the rest of this word, or else the next one.
+                let rest = &a[pos + c.len_utf8()..];
+                let value = if rest.is_empty() {
+                    i += 1;
+                    args.get(i).copied()
+                } else {
+                    Some(rest)
+                };
+                if c == 't' {
+                    target = value;
+                }
+                break;
+            }
+            flags.push(c);
+        }
+        i += 1;
+    }
+    (flags, target)
 }
 
 /// The single request a `select-pane`'s `-t` emits (issue #691).
@@ -869,7 +1110,7 @@ pub(crate) fn readonly_client_may_run(cmd: &str) -> bool {
         // psmux client protocol
         "dump-state" | "dump" | "dump-layout" | "session-info" | "client-size"
         | "host-colors" | "client-attach" | "client-detach" | "client-last-session"
-        | "client-flags" | "focus-in" | "focus-out" | "prefix-begin" | "prefix-end"
+        | "client-flags" | "client-environ" | "focus-in" | "focus-out" | "prefix-begin" | "prefix-end"
         | "overlay-close" | "window-layout" | "window-dump" | "list-tree"
         // tmux CMD_READONLY commands
         | "attach-session" | "attach" | "detach-client" | "detach"
@@ -941,7 +1182,7 @@ let client_id = crate::types::next_client_id();
 let _ = stream.set_nodelay(true);
 // Clone stream for writing, original goes into BufReader for reading
 let mut write_stream = match stream.try_clone() {
-    Ok(s) => ReplyStream(s),
+    Ok(s) => ReplyStream::new(s),
     Err(_) => return,
 };
 // Every socket handle on this connection must be non-inheritable: the server
@@ -1327,6 +1568,14 @@ if control_echo || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
+        // Clustered select-pane / last-pane flags, as in the one-shot route.
+        let ctrl_cluster_split: Vec<String>;
+        let cmd_args: Vec<&str> = if matches!(cmd_name, "select-pane" | "selectp" | "last-pane" | "lastp") {
+            ctrl_cluster_split = crate::cli::expand_flag_clusters(cmd_name, &cmd_args);
+            ctrl_cluster_split.iter().map(|s| s.as_str()).collect()
+        } else {
+            cmd_args
+        };
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -1401,7 +1650,11 @@ if control_echo || control_noecho {
         let ctrl_sp_attr_only = matches!(cmd_name, "select-pane" | "selectp")
             && cmd_args.windows(2).any(|w| w[0] == "-T" || w[0] == "-P")
             && !cmd_args.iter().any(|a| matches!(*a, "-U" | "-D" | "-L" | "-R" | "-l" | "-m" | "-M" | "-e" | "-d"));
-        let is_focus_cmd = matches!(cmd_name, "select-window" | "selectw" | "select-pane" | "selectp") && !ctrl_sp_attr_only;
+        // select-pane -d/-e: validated target, never focused (see the
+        // one-shot route's `sp_input_toggle`).
+        let ctrl_sp_input_toggle = matches!(cmd_name, "select-pane" | "selectp")
+            && select_pane_input_toggle(&cmd_args, ctrl_raw_target.as_deref()).is_some();
+        let is_focus_cmd = matches!(cmd_name, "select-window" | "selectw" | "select-pane" | "selectp") && !ctrl_sp_attr_only && !ctrl_sp_input_toggle;
         // Same skip list as the one-shot path below. The two lists had
         // diverged (issue #545 sub-note): join-pane/move-pane/move-window/
         // swap-window/switch-client resolve their own targets (or name a
@@ -1429,7 +1682,10 @@ if control_echo || control_noecho {
         // active pane (temp-focusing the target would make active == target
         // and turn the swap into a no-op).
         let ctrl_capture_by_id = matches!(cmd_name, "capture-pane" | "capturep") && ctrl_pane_is_id && ctrl_target_pane.is_some();
-        let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id;
+        // select-pane -d/-e -t %N may name a floating pane, which ValidateTarget
+        // cannot see; set_pane_input_off resolves the id itself.
+        let ctrl_input_toggle_by_id = ctrl_sp_input_toggle && ctrl_pane_is_id && ctrl_target_pane.is_some();
+        let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id || ctrl_input_toggle_by_id;
         // Issue #635: a dangling value-taking flag is reported through the
         // same %error path as an unresolvable -t, and skips dispatch (and the
         // temp focus below) entirely, so control clients see tmux's message
@@ -1637,6 +1893,8 @@ let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(10)));
 let mut attached_sent = false;
 // `attach -r` (issue #724): set by the client's `client-flags read-only`.
 let mut client_readonly = false;
+// The client's environment from `client-environ` (#775 update-environment).
+let mut client_environ: Option<Vec<(String, String)>> = None;
 let mut pending_chain: Vec<String> = Vec::new();
 // The rest of a command list that follows a foreground run-shell, held until
 // that shell exits (PR #740). tmux runs `run-shell X \; cmd` in that order: the
@@ -1654,9 +1912,15 @@ loop {
             pending_chain = deferred_chains.remove(i).1;
         }
     }
+    // A failed command ends the rest of its list (see ReplyStream::take_error).
+    if write_stream.take_error() && !persistent {
+        pending_chain.clear();
+    }
     // Check pending chained commands before reading from socket
+    let mut from_list = false;
     if !pending_chain.is_empty() {
         line = pending_chain.remove(0);
+        from_list = true;
     } else if line.trim().is_empty() {
         // Try to read another command with timeout
         line.clear();
@@ -1714,10 +1978,17 @@ loop {
     // Use quote-aware parser to preserve arguments with spaces
     // Handle command chaining (\; or ;) by splitting into sub-commands
     let sub_cmds = crate::config::split_chained_commands_pub(line.trim());
+    // This command is one of a list (`a ; b`), whose rest stops if it fails.
+    let in_command_list = from_list || sub_cmds.len() > 1;
     let effective_line: String;
     if sub_cmds.len() > 1 {
         effective_line = sub_cmds[0].clone();
-        pending_chain.extend(sub_cmds.into_iter().skip(1));
+        // Ahead of whatever is already queued: a line that splits here while
+        // a list is pending is an `if-shell` branch fed back below, and tmux
+        // inserts a branch's commands right after the if-shell item
+        // (cmd-if-shell.c cmdq_insert_after), before the rest of the list.
+        // Appended, `if-shell C 'a ; b' ; c` ran a, c, b.
+        pending_chain.splice(0..0, sub_cmds.into_iter().skip(1));
     } else {
         effective_line = line.trim().to_string();
     }
@@ -1736,6 +2007,16 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
+    // select-pane / last-pane read flags by exact token below (the -t scan,
+    // the -l/-m/-T arms), so a clustered `-dt %2` lost its target and fenced
+    // the ACTIVE pane.  Split clusters the way tmux's getopt reads them.
+    let cluster_split: Vec<String>;
+    let args: Vec<&str> = if matches!(cmd, "select-pane" | "selectp" | "last-pane" | "lastp") {
+        cluster_split = crate::cli::expand_flag_clusters(cmd, &args);
+        cluster_split.iter().map(|s| s.as_str()).collect()
+    } else {
+        args
+    };
 
 // Issue #635: a value-taking flag with nothing after it never runs. Checked
 // here, before any target resolution or temp focus, so the failure path has
@@ -1743,6 +2024,10 @@ loop {
 if let Err(flag_error) = crate::cli::validate_flag_arguments(cmd, &args) {
     let _ = writeln!(write_stream, "ERROR: {}", flag_error);
     let _ = write_stream.flush();
+    // A failed command ends a one-shot connection with the rest of its chain
+    // unrun, as tmux removes the rest of a command list after an error
+    // (cmd-queue.c). Commands that succeed break only once the chain is
+    // drained (`if !persistent && pending_chain.is_empty()` below).
     if !persistent { break; }
     line.clear();
     continue;
@@ -1839,8 +2124,12 @@ if set_option_command {
 let sp_attr_only = matches!(cmd, "select-pane" | "selectp")
     && args.windows(2).any(|w| w[0] == "-T" || w[0] == "-P")
     && !args.iter().any(|a| matches!(*a, "-U" | "-D" | "-L" | "-R" | "-l" | "-m" | "-M" | "-e" | "-d"));
+// select-pane -d/-e (tmux PANE_INPUTOFF) selects nothing either: its -t is
+// validated like any other command's and handed to the request, never focused.
+let sp_input_toggle = matches!(cmd, "select-pane" | "selectp")
+    && select_pane_input_toggle(&args, raw_target.as_deref()).is_some();
 // Commands that should permanently change focus when used with -t
-let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp") && !sp_attr_only;
+let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp") && !sp_attr_only && !sp_input_toggle;
 // Commands that handle -t internally and should NOT get FocusWindowTemp.
 // switch-client resolves the window/pane target itself (#483) and makes the
 // change PERMANENT; letting the generic block issue a temporary focus here
@@ -1878,7 +2167,10 @@ let targeted_kill_pane_id = if matches!(cmd, "kill-pane" | "killp") && pane_is_i
 let capture_pane_by_id = matches!(cmd, "capture-pane" | "capturep") && pane_is_id && target_pane.is_some();
 // swap-pane swaps the target with the *current* active pane; focusing the
 // target first would make active == target and turn the swap into a no-op.
-let skip_pane_focus = matches!(cmd, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || capture_pane_by_id;
+// select-pane -d/-e -t %N may name a floating pane, which ValidateTarget
+// cannot see; set_pane_input_off resolves the id itself.
+let input_toggle_by_id = sp_input_toggle && pane_is_id && target_pane.is_some();
+let skip_pane_focus = matches!(cmd, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || capture_pane_by_id || input_toggle_by_id;
 // Issue #690: `select-window` decides its own window target, in
 // `select_window_requests`, and this block does not touch it.  Both used
 // to act on it, a permanent FocusWindow here and a SelectWindow from the
@@ -1894,6 +2186,25 @@ let selectp_owns_target = matches!(cmd, "select-pane" | "selectp");
 // command has no -t, or owns it, and acts on the real focus).
 let mut command_target: Option<crate::types::TempTarget> = None;
 if is_focus_cmd {
+    // A select-pane alone on the command line had its target checked by the
+    // CLI (cli_validate_window_pane_target); one inside a list did not, and
+    // its request has no reply. Check it here so a target that names nothing
+    // is tmux's "can't find pane" and ends the list.
+    let has_target = target_win.is_some() || target_win_name.is_some() || target_pane.is_some();
+    if selectp_owns_target && !persistent && in_command_list && has_target {
+        let spec = crate::types::TempTarget {
+            win: target_win,
+            win_is_id: target_win_is_id,
+            win_name: target_win_name.clone(),
+            pane: target_pane,
+            pane_is_id,
+        };
+        if let Err(e) = validate_target(&tx, spec) {
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
+            break;
+        }
+    }
     if selectp_owns_target {
         for req in select_pane_requests(
             &args, raw_target.as_deref(), target_win, target_win_is_id,
@@ -2002,7 +2313,7 @@ match cmd {
                     let _ = write_stream.flush();
                 }
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else if persistent {
             let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets, placement, None));
         } else {
@@ -2062,7 +2373,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title, env_sets, zoom_after_split));
@@ -2123,7 +2434,7 @@ match cmd {
                     let _ = write_stream.write_all(text.as_bytes());
                     let _ = write_stream.flush();
                 }
-                if !persistent { break; }
+                if !persistent && pending_chain.is_empty() { break; }
             } else {
                 let _ = tx.send(CtrlReq::SetBuffer(text));
             }
@@ -2140,7 +2451,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "dump-state" | "dump" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -2155,7 +2466,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); 
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         }
     }
     "send-text" => {
@@ -2332,9 +2643,9 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
-    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } } if !persistent { break; } }
+    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } } if !persistent && pending_chain.is_empty() { break; } }
     "window-layout" => {
         // Issue #257: return simplified layout JSON for a given window id.
         // Usage: window-layout <window_id>
@@ -2350,7 +2661,7 @@ match cmd {
             let _ = write!(write_stream, "{{}}\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "window-dump" => {
         // Return a fully styled LayoutJson, or the layout plus preview styles
@@ -2373,7 +2684,7 @@ match cmd {
             let _ = write!(write_stream, "{{}}\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
@@ -2530,6 +2841,24 @@ match cmd {
             }
         }
     }
+    "select-pane" | "selectp" if sp_input_toggle => {
+        // select-pane -d / -e: tmux's PANE_INPUTOFF, on the -t pane (or with
+        // -l the last pane), selecting nothing (cmd-select-pane.c).
+        let (off, last) = select_pane_input_toggle(&args, raw_target.as_deref()).unwrap_or((true, false));
+        let (resp_s, resp_r) = mpsc::channel();
+        tx.send_unwrapped(CtrlReq::SetPaneInputOff {
+            target: input_toggle_target(tx.target(), target_pane, pane_is_id),
+            off,
+            last,
+            resp: Some(resp_s),
+        });
+        if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
+        }
+    }
     "select-pane" | "selectp" => {
         // Detect relative pane targets: -t :.+  or  -t :.-
         let is_next_pane = raw_target.as_deref().map_or(false, |t| t.contains(".+") || t == "+" || t == ":.+");
@@ -2543,8 +2872,7 @@ match cmd {
             else if args.iter().any(|a| *a == "-l") { "last" }
             else if args.iter().any(|a| *a == "-m") { "mark" }
             else if args.iter().any(|a| *a == "-M") { "unmark" }
-            else if args.iter().any(|a| *a == "-e") { "enable-input" }
-            else if args.iter().any(|a| *a == "-d") { "disable-input" }
+            // -e / -d without any of the above are the input toggle arm.
             else { "" };
         // Check for -T title and -P style (per-pane style, e.g.
         // "bg=default,fg=blue" — Claude Code uses -P for agent pane
@@ -2626,7 +2954,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "kill-window" | "killw" => {
         // Resolve the -t target server-side. The generic temp-focus block is
@@ -2662,7 +2990,12 @@ match cmd {
         if let Some(ref tgt) = raw_target {
             let port_path = crate::paths::port_file(tgt);
             let mut handled = false;
-            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+            // A differently spelled registry entry is another session: never
+            // kill `repro-case` for `-t REPRO-CASE` (issue #774).
+            let case_variant = crate::session::registry_case_variant(tgt).is_some();
+            if case_variant {
+                // fall through to the exact self-name comparison below
+            } else if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                 if let Ok(port) = port_str.trim().parse::<u16>() {
                     let key = crate::session::read_session_key(tgt).unwrap_or_default();
                     let _ = crate::session::send_control_to_port(port, "kill-session\n", &key);
@@ -2900,7 +3233,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "show-buffer" | "showb" => {
         let buf_name: Option<String> = args.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
@@ -2922,7 +3255,7 @@ match cmd {
         } else {
             let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "delete-buffer" => {
         let buf_name: Option<String> = args.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
@@ -2960,7 +3293,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "display-message" | "display" => {
         // Parse tmux-like display-message flags without dropping message text.
@@ -3038,9 +3371,27 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
+    "last-pane" | "lastp" if last_pane_input_toggle(&args).is_some() => {
+        // last-pane -d / -e: select-pane -l -d / -e, the -t naming the
+        // window whose last pane it is; nothing is selected.
+        let off = last_pane_input_toggle(&args).unwrap_or(true);
+        let (resp_s, resp_r) = mpsc::channel();
+        tx.send_unwrapped(CtrlReq::SetPaneInputOff {
+            target: tx.target().cloned(),
+            off,
+            last: true,
+            resp: Some(resp_s),
+        });
+        if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
+        }
+    }
     "last-pane" | "lastp" => {
         // tmux's last-pane shares cmd_select_pane_exec with `select-pane -l`,
         // so it owes the same `no last pane` at exit 1 (cmd-select-pane.c:176).
@@ -3197,7 +3548,7 @@ match cmd {
             let _ = write!(write_stream, "ERR timeout\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-inject" => {
         // Usage: pane-forward-inject <src_session> <src_addr> <src_key> <fwd_id> <fwd_port>
@@ -3258,7 +3609,7 @@ match cmd {
             let _ = write!(write_stream, "ERR not enough args\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-resize" => {
         // Usage: pane-forward-resize <forward_id> <rows> <cols>
@@ -3270,7 +3621,7 @@ match cmd {
             let _ = write!(write_stream, "OK\n");
         }
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-status" => {
         // Usage: pane-forward-status <forward_id>
@@ -3283,7 +3634,7 @@ match cmd {
             let _ = write!(write_stream, "exited\n");
         }
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-kill" => {
         // Usage: pane-forward-kill <forward_id>
@@ -3291,7 +3642,7 @@ match cmd {
         let _ = tx.send(CtrlReq::PaneForwardKill(fwd_id));
         let _ = write!(write_stream, "OK\n");
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "session-info" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -3307,10 +3658,25 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", line); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
+    }
+    "client-environ" => {
+        // The attaching client's environment (tmux MSG_IDENTIFY_ENVIRON), a
+        // base64 Windows environment block, for update-environment (#775).
+        use base64::Engine;
+        client_environ = args.first()
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.as_bytes()).ok())
+            .and_then(|bytes| crate::client_env::decode_env_block(&bytes))
+            .map(|entries| entries.into_iter()
+                .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                .collect());
+        if !persistent { let _ = write!(write_stream, "ok\n"); }
     }
     "client-attach" => {
         if !attached_sent {
+            if let Some(env) = client_environ.clone() {
+                let _ = tx.send(CtrlReq::ClientEnviron(env));
+            }
             let _ = tx.send(CtrlReq::ClientAttach(client_id, connection_peer_pid(r.get_ref())));
             attached_sent = true;
         }
@@ -3351,11 +3717,18 @@ match cmd {
     "bind-key" | "bind" => {
         let mut table = "prefix".to_string();
         let mut repeatable = false;
+        let mut note: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i] {
                 "-T" if i + 1 < args.len() => {
                     table = args[i + 1].to_string();
+                    i += 2; continue;
+                }
+                // tmux bind-key -N note (cmd-bind-key.c "nrN:T:"). Unknown
+                // here, it was read as the KEY and the binding vanished.
+                "-N" if i + 1 < args.len() => {
+                    note = Some(args[i + 1].to_string());
                     i += 2; continue;
                 }
                 "-n" => { table = "root".to_string(); i += 1; continue; }
@@ -3380,7 +3753,7 @@ match cmd {
                 let _ = writeln!(write_stream, "ERROR: {}", flag_error);
                 let _ = write_stream.flush();
             } else {
-                let _ = tx.send(CtrlReq::BindKey(table, key, command, repeatable));
+                let _ = tx.send(CtrlReq::BindKey(table, key, command, repeatable, note));
             }
         }
     }
@@ -3425,6 +3798,20 @@ match cmd {
             }
         }
     }
+    "list-keys" | "lsk" if args.iter().any(|a| list_keys_flag(a, 'N')) => {
+        // tmux list-keys -N: the bindings that carry a note, as notes.
+        let (table, all, key) = list_keys_notes_args(&args);
+        let (rtx, rrx) = mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::ListKeyNotes(rtx, table, all, key));
+        if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
+            if persistent {
+                let _ = tx.send(CtrlReq::ShowTextPopup("list-keys".to_string(), text));
+            } else {
+                let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
+            }
+        }
+        if !persistent && pending_chain.is_empty() { break; }
+    }
     "list-keys" | "lsk" => {
         // Parse -T <table> for filtering by key table
         let table_filter = args.windows(2).find(|w| w[0] == "-T").map(|w| w[1].to_string());
@@ -3442,22 +3829,19 @@ match cmd {
         if let Ok(text) = rrx.recv() {
             let filtered = if table_filter.is_some() || key_filter.is_some() {
                 text.lines().filter(|line| {
+                    // list-keys output format: "bind-key [-r] -T <table> <key> <command>".
+                    // The optional -r shifts every field, so read the table
+                    // and key after the -T rather than at fixed positions (a
+                    // repeatable binding used to vanish from -T and key filters).
+                    let (line_table, line_key) = list_keys_line_table_key(line);
                     if let Some(ref tbl) = table_filter {
-                        // list-keys output format: "bind-key -T <table> <key> <command>"
-                        let parts: Vec<&str> = line.splitn(5, ' ').collect();
-                        if parts.len() >= 3 {
-                            if parts[2] != tbl.as_str() {
-                                return false;
-                            }
-                        } else {
+                        if line_table != Some(tbl.as_str()) {
                             return false;
                         }
                     }
                     if let Some(ref key) = key_filter {
-                        // Filter by key name (4th field)
-                        let parts: Vec<&str> = line.splitn(5, ' ').collect();
-                        if parts.len() >= 4 {
-                            if parts[3] != key.as_str() {
+                        if let Some(k) = line_key {
+                            if k != key.as_str() {
                                 return false;
                             }
                         }
@@ -3473,7 +3857,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", filtered); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "set-option" | "set" | "set-window-option" | "setw" => {
         // Flags parse only BEFORE the first positional, and `--` ends option
@@ -3752,7 +4136,7 @@ match cmd {
                     let _ = write_stream.flush();
                 }
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
             continue;
         }
         let opt_name: Option<&str> = args.iter()
@@ -3899,7 +4283,7 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "source-file" | "source" => {
         let format_expand = args.iter().any(|a| *a == "-F");
@@ -3912,7 +4296,19 @@ match cmd {
                 } else {
                     path.to_string()
                 };
-                let _ = tx.send(CtrlReq::SourceFile(source_spec));
+                // A one-shot source-file answers once the file has run, as
+                // tmux's does: cmd-source-file.c returns CMD_RETURN_WAIT and
+                // the item continues only when the inserted commands are done
+                // (cmd_source_file_done, :131), and the client exits after
+                // that. It used to answer at once while the server went on
+                // running the file (if-shell conditions are shells), so the
+                // caller's next query queued behind the whole file and timed
+                // out on a loaded machine (#734 follow up, side findings 2B).
+                let (done_tx, done_rx) = mpsc::channel::<()>();
+                let waiter = (!persistent).then_some(done_tx);
+                let _ = tx.send(CtrlReq::SourceFile(source_spec, waiter));
+                // Disconnected once the server loop drops the sender.
+                let _ = done_rx.recv();
             }
         }
     }
@@ -4029,7 +4425,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pipe-pane" | "pipep" => {
         let stdin_flag = args.iter().any(|a| *a == "-I");
@@ -4090,7 +4486,7 @@ match cmd {
                 let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "switch-client" | "switchc" => {
         let has_big_t = args.windows(2).any(|w| w[0] == "-T");
@@ -4142,7 +4538,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "lock-client" | "lockc" => {
         let _ = tx.send(CtrlReq::LockClient);
@@ -4186,32 +4582,55 @@ match cmd {
         let _ = tx.send(CtrlReq::LoadBuffer(path));
     }
     "set-environment" | "setenv" => {
-        let has_u = args.iter().any(|a| {
-            if *a == "-u" { return true; }
-            a.starts_with('-') && a.len() > 2 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) && a.contains('u')
-        });
-        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-        if has_u {
-            if let Some(key) = non_flag.first() {
-                let _ = tx.send(CtrlReq::UnsetEnvironment(key.to_string()));
+        // tmux cmd-set-environment.c: -g global / session scope, -u unset,
+        // -r removal marker, -h hidden, -F format expanded value (#775).
+        match crate::environ::parse_set_environment(&args) {
+            Ok(mut parsed) => {
+                if let Some(v) = parsed.value.take() {
+                    parsed.value = Some(expand_set_option_value(tx, parsed.format, v));
+                }
+                let _ = tx.send(CtrlReq::SetEnvironment(parsed));
             }
-        } else if non_flag.len() >= 2 {
-            let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), non_flag[1].to_string()));
-        } else if non_flag.len() == 1 {
-            let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), String::new()));
+            Err(e) => {
+                if persistent {
+                    let _ = tx.send(CtrlReq::StatusMessage(e));
+                } else {
+                    let _ = writeln!(write_stream, "ERROR: {}", e);
+                    let _ = write_stream.flush();
+                }
+            }
         }
     }
     "show-environment" | "showenv" => {
-        let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
-        if let Ok(text) = rrx.recv() {
-            if persistent {
-                let _ = tx.send(CtrlReq::ShowTextPopup("show-environment".to_string(), text));
-            } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+        // tmux cmd-show-environment.c: one entry for a NAME, `-NAME` for a
+        // removal, `unknown variable: NAME` for a miss, -g the global
+        // (server start) environment, -s shell syntax, -h hidden (#775).
+        let reply = match crate::environ::parse_show_environment(&args) {
+            Ok(parsed) => {
+                let (rtx, rrx) = mpsc::channel::<Result<String, String>>();
+                let _ = tx.send(CtrlReq::ShowEnvironment(parsed, rtx));
+                rrx.recv().ok()
             }
+            Err(e) => Some(Err(e)),
+        };
+        match reply {
+            Some(Ok(text)) => {
+                if persistent {
+                    let _ = tx.send(CtrlReq::ShowTextPopup("show-environment".to_string(), text));
+                } else {
+                    let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
+                }
+            }
+            Some(Err(e)) => {
+                if persistent {
+                    let _ = tx.send(CtrlReq::StatusMessage(e));
+                } else {
+                    let _ = writeln!(write_stream, "ERROR: {}", e); let _ = write_stream.flush();
+                }
+            }
+            None => {}
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "set-hook" => {
         // Same positional discipline as set-option (#583): flags parse only
@@ -4275,7 +4694,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "wait-for" => {
         let lock = args.iter().any(|a| *a == "-L");
@@ -4335,7 +4754,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let _ = tx.send(CtrlReq::NewFloat { command: p.command, x: p.x, y: p.y, w: p.w, h: p.h, border: p.border, title: p.title, start_dir: p.start_dir, detached: p.detached, empty: p.empty, resp: None });
         }
@@ -4423,6 +4842,9 @@ match cmd {
     }
     "attach-session" | "attach" => {
         if !attached_sent {
+            if let Some(env) = client_environ.clone() {
+                let _ = tx.send(CtrlReq::ClientEnviron(env));
+            }
             let _ = tx.send(CtrlReq::ClientAttach(client_id, connection_peer_pid(r.get_ref())));
             attached_sent = true;
         }
@@ -4441,7 +4863,7 @@ match cmd {
             // caller reads it until EOF and force-kills the pid 50ms after,
             // so an early close makes the force-kill land in the middle of
             // the shutdown and orphan whatever it had not killed yet (#686).
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(crate::warm_pane_sync::KILL_SERVER_HOLD);
         }
     }
     "choose-tree" | "choose-window" | "choose-session" => {
@@ -4456,7 +4878,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "copy-mode" => {
         // `-q` leaves, `-H` hides the position indicator for this entry only
@@ -4534,7 +4956,7 @@ match cmd {
         if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
             let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "show-messages" | "showmsgs" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -4546,7 +4968,7 @@ match cmd {
                 let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "command-prompt" => {
         let initial = args.windows(2).find(|w| w[0] == "-I").map(|w| w[1].to_string()).unwrap_or_default();
@@ -4582,27 +5004,12 @@ match cmd {
         } else {
             trimmed.to_string()
         };
-        // Expand #{...} against live server state (tmux parity). This thread has
-        // no &AppState — it belongs to the server loop — so the expansion makes
-        // a round trip over the control channel. Only pay for it when the
-        // command actually contains a format reference.
-        //
-        // Without this, `run-shell "helper '#{pane_id}'"` passed the helper the
+        // Expand formats against live server state (tmux parity). Without
+        // this, `run-shell "helper '#{pane_id}'"` passed the helper the
         // literal text `#{pane_id}`; with `-b` swallowing the spawn result, the
-        // bind then failed completely silently.
-        let shell_cmd = if shell_cmd.contains("#{") {
-            let (rtx, rrx) = mpsc::channel::<String>();
-            if tx.send(CtrlReq::ExpandFormat(shell_cmd.clone(), rtx)).is_ok() {
-                // On timeout fall back to the unexpanded string: running the
-                // command with a literal #{...} is no worse than the old
-                // behaviour, and better than dropping it silently.
-                rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(shell_cmd)
-            } else {
-                shell_cmd
-            }
-        } else {
-            shell_cmd
-        };
+        // bind then failed completely silently. Every `#` sequence counts, not
+        // only `#{`: tmux turns `##` into `#` and `#S` into the session name.
+        let shell_cmd = expand_shell_command(tx, shell_cmd);
         // Expand ~ to home directory + XDG fallback for plugin paths
         let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd);
         if shell_cmd.is_empty() {
@@ -4725,23 +5132,42 @@ match cmd {
                 let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, None, client));
                 let expanded = rrx.recv().unwrap_or_default();
                 !expanded.is_empty() && expanded != "0"
-            } else if condition == "true" || condition == "1" {
-                true
-            } else if condition == "false" || condition == "0" {
-                false
             } else {
-                // Use resolve_run_shell for consistent shell fallback
-                let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
-                let mut c = std::process::Command::new(&shell_prog);
-                for a in &shell_args { c.arg(a); }
-                c.arg(condition.as_str());
-                c.stdout(std::process::Stdio::null());
-                c.stderr(std::process::Stdio::null());
-                { use crate::platform::HideWindowCommandExt; c.hide_window(); }
-                c.status().map(|s| s.success()).unwrap_or(false)
+                // The shell command is format expanded before it runs, like
+                // tmux (cmd-if-shell.c:86). It went to the shell verbatim, so
+                // a guard such as `if-shell 'check #{pid}'` saw the literal
+                // `#{pid}` while `if-shell -F` and run-shell expanded theirs
+                // (issue #734 follow up).
+                let condition = expand_shell_command(tx, condition.to_string());
+                if condition == "true" || condition == "1" {
+                    true
+                } else if condition == "false" || condition == "0" {
+                    false
+                } else {
+                    // Use resolve_run_shell for consistent shell fallback
+                    let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
+                    let mut c = std::process::Command::new(&shell_prog);
+                    for a in &shell_args { c.arg(a); }
+                    c.arg(condition.as_str());
+                    c.stdout(std::process::Stdio::null());
+                    c.stderr(std::process::Stdio::null());
+                    { use crate::platform::HideWindowCommandExt; c.hide_window(); }
+                    c.status().map(|s| s.success()).unwrap_or(false)
+                }
             };
             let cmd_to_run = if success { Some(true_cmd) } else { false_cmd };
             if let Some(chosen) = cmd_to_run {
+                if !pending_chain.is_empty() {
+                    // Inside a list the branch goes to the FRONT of what is
+                    // queued, as tmux inserts it right after the if-shell item
+                    // (cmd-if-shell.c:100 and :169, cmdq_insert_after). Put in
+                    // `line`, the top of the loop took the next queued command
+                    // over it, so `if-shell C 'a ; b' ; c` ran only c (#734
+                    // follow up).
+                    pending_chain.insert(0, chosen.to_string());
+                    line.clear();
+                    continue;
+                }
                 // Feed the chosen command back into the line buffer so the
                 // main dispatch loop processes it as a regular command.
                 line.clear();
@@ -4774,7 +5200,7 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "new-session" | "new" => {
         // new-session -t target: set session group on this server
@@ -4844,10 +5270,21 @@ match cmd {
                 // server it reached), the warm claim, a held server's claim
                 // (#734: the session lands in the empty server the caller
                 // already identified), and the `-P`/`-F` report.
+                //
+                // The rest of its command list runs after it (#734 follow
+                // up): this arm used to `break` unconditionally, so in
+                // `new-session -d -P ; display-message -p CREATED` the marker
+                // never ran. tmux runs every command of a list in order and
+                // stops only at one that fails (cmd-queue.c cmdq_next and
+                // cmdq_remove_group); a failure here is an `ERROR:` reply,
+                // which clears the list at the top of the loop.
                 let out = run_cli_new_session(&args);
-                let _ = write!(write_stream, "{}", out);
-                let _ = write_stream.flush();
-                break;
+                let out = one_shot_new_session_reply(out, in_command_list);
+                if !out.is_empty() {
+                    let _ = write!(write_stream, "{}", out);
+                    let _ = write_stream.flush();
+                }
+                if pending_chain.is_empty() { break; }
             } else {
 
             let ns = crate::server::server_namespace();
@@ -4966,7 +5403,7 @@ match cmd {
             let _ = write!(write_stream, "{}\n", cmds);
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "server-info" | "info" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -4978,11 +5415,11 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "start-server" => {
         // Server is already running if we're here, no-op
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "send-prefix" => {
         let _ = tx.send(CtrlReq::SendPrefix);
@@ -5074,7 +5511,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "customize-mode" => {
         // tmux 3.2+ customize-mode: interactive options editor
@@ -5103,14 +5540,31 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
-    _ => {}
+    _ => {
+        // A name no arm knows did nothing at all, silently, and the list
+        // went on (`set @a 1 ; bogus ; set @b 2` set both at exit 0). tmux
+        // refuses an unknown command ("unknown command: bogus") and runs
+        // none of the list after it; the reply's ERROR ends the list here.
+        if !persistent && in_command_list && !is_catalog_command(cmd) {
+            let _ = writeln!(write_stream, "ERROR: unknown command: {}", cmd);
+            let _ = write_stream.flush();
+        }
+    }
 }
 }
-    // Process pending chained commands before reading from socket
+    // Process pending chained commands before reading from socket. A command
+    // that answered with an error ends the list there, as tmux's cmd-queue.c
+    // removes the rest of a command list after CMD_RETURN_ERROR.
+    if write_stream.take_error() && !persistent {
+        pending_chain.clear();
+    }
+    // The next command is taken at the top of the loop. Taking it here as
+    // well skipped every other command of a list of three or more: this one
+    // was overwritten there by the one after it.
     if !pending_chain.is_empty() {
-        line = pending_chain.remove(0);
+        line.clear();
         continue;
     }
     // Try to read next command for batching (with timeout)
@@ -5536,6 +5990,23 @@ fn dispatch_control_command(
             let _ = resp_tx.send(String::new());
             true
         }
+        "select-pane" | "selectp" if select_pane_input_toggle(args, raw_target).is_some() => {
+            // select-pane -d / -e (tmux PANE_INPUTOFF); same request as the
+            // one-shot route, target carried inside it, nothing focused.
+            let (off, last) = select_pane_input_toggle(args, raw_target).unwrap_or((true, false));
+            let (resp_s, resp_r) = mpsc::channel();
+            tx.send_unwrapped(CtrlReq::SetPaneInputOff {
+                target: input_toggle_target(tx.target(), target_pane, pane_is_id),
+                off,
+                last,
+                resp: Some(resp_s),
+            });
+            match resp_r.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
+            true
+        }
         "select-pane" | "selectp" => {
             // Handle -T title / -P style. One SetPaneAttrs request (#592):
             // under a temporary -t focus the restore fires after the first
@@ -5843,6 +6314,15 @@ fn dispatch_control_command(
             }
             true
         }
+        "list-keys" | "lsk" if args.iter().any(|a| list_keys_flag(a, 'N')) => {
+            let (table, all, key) = list_keys_notes_args(&args);
+            let (rtx, rrx) = mpsc::channel::<String>();
+            let _ = tx.send(CtrlReq::ListKeyNotes(rtx, table, all, key));
+            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
+                let _ = resp_tx.send(text.trim_end_matches('\n').to_string());
+            }
+            true
+        }
         "list-keys" | "lsk" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ListKeys(rtx));
@@ -5959,7 +6439,7 @@ fn dispatch_control_command(
             // this socket, which is the EOF the caller actually wants. The
             // sleep is the wedged-server fallback: if the shutdown never
             // happens, answer late rather than never.
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(crate::warm_pane_sync::KILL_SERVER_HOLD);
             let _ = resp_tx.send(String::new());
             true
         }
@@ -6060,11 +6540,16 @@ fn dispatch_control_command(
             // the key name as the verbatim command (preserving flags like -c).
             let mut table_name = "prefix".to_string();
             let mut repeat = false;
+            let mut note: Option<String> = None;
             let mut i = 0;
             while i < args.len() {
                 match args[i] {
                     "-T" if i + 1 < args.len() => {
                         table_name = args[i + 1].to_string();
+                        i += 2; continue;
+                    }
+                    "-N" if i + 1 < args.len() => {
+                        note = Some(args[i + 1].to_string());
                         i += 2; continue;
                     }
                     "-n" => { table_name = "root".to_string(); i += 1; continue; }
@@ -6075,7 +6560,7 @@ fn dispatch_control_command(
             if i < args.len() && i + 1 < args.len() {
                 let key = args[i].to_string();
                 let command = requote_command_tail(&args[i + 1..]);
-                let _ = tx.send(CtrlReq::BindKey(table_name, key, command, repeat));
+                let _ = tx.send(CtrlReq::BindKey(table_name, key, command, repeat, note));
             }
             let _ = resp_tx.send(String::new());
             true
@@ -6124,30 +6609,37 @@ fn dispatch_control_command(
         }
         "source-file" | "source" => {
             if let Some(path) = args.first() {
-                let _ = tx.send(CtrlReq::SourceFile(path.trim_matches('"').to_string()));
+                let _ = tx.send(CtrlReq::SourceFile(path.trim_matches('"').to_string(), None));
             }
             let _ = resp_tx.send(String::new());
             true
         }
         "set-environment" | "setenv" => {
-            let unset = args.iter().any(|a| {
-                if *a == "-u" { return true; }
-                a.starts_with('-') && a.len() > 2 && a.chars().skip(1).all(|c| c.is_ascii_alphabetic()) && a.contains('u')
-            });
-            let positional: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-            if unset && !positional.is_empty() {
-                let _ = tx.send(CtrlReq::UnsetEnvironment(positional[0].to_string()));
-            } else if positional.len() >= 2 {
-                let _ = tx.send(CtrlReq::SetEnvironment(positional[0].to_string(), positional[1].to_string()));
+            // Same parser and semantics as the CLI/TCP arm (#775).
+            match crate::environ::parse_set_environment(args) {
+                Ok(mut parsed) => {
+                    if let Some(v) = parsed.value.take() {
+                        parsed.value = Some(expand_set_option_value(tx, parsed.format, v));
+                    }
+                    let _ = tx.send(CtrlReq::SetEnvironment(parsed));
+                    let _ = resp_tx.send(String::new());
+                }
+                Err(e) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
             }
-            let _ = resp_tx.send(String::new());
             true
         }
         "show-environment" | "showenv" => {
-            let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
+            match crate::environ::parse_show_environment(args) {
+                Ok(parsed) => {
+                    let (rtx, rrx) = mpsc::channel::<Result<String, String>>();
+                    let _ = tx.send(CtrlReq::ShowEnvironment(parsed, rtx));
+                    match rrx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(Ok(text)) => { let _ = resp_tx.send(text); }
+                        Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                        Err(_) => {}
+                    }
+                }
+                Err(e) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
             }
             true
         }
@@ -6210,6 +6702,21 @@ fn dispatch_control_command(
         "last-window" | "last" => {
             let _ = tx.send(CtrlReq::LastWindow);
             let _ = resp_tx.send(String::new());
+            true
+        }
+        "last-pane" | "lastp" if last_pane_input_toggle(args).is_some() => {
+            let off = last_pane_input_toggle(args).unwrap_or(true);
+            let (resp_s, resp_r) = mpsc::channel();
+            tx.send_unwrapped(CtrlReq::SetPaneInputOff {
+                target: tx.target().cloned(),
+                off,
+                last: true,
+                resp: Some(resp_s),
+            });
+            match resp_r.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
             true
         }
         "last-pane" | "lastp" => {
@@ -6490,3 +6997,11 @@ mod tests_issue693_targets;
 #[cfg(test)]
 #[path = "../../tests-rs/test_client_read_timeout.rs"]
 mod tests_client_read_timeout;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_reply_stream_error.rs"]
+mod tests_reply_stream_error;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue734_followup_new_session_reply.rs"]
+mod tests_issue734_followup_new_session_reply;

@@ -1068,7 +1068,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             let spare_cwd = wp.spawn_cwd.take();
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
+            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
             // A warm-pool spare is only claimed for a DEFAULT-SHELL pane
             // (`command.is_none()` gates this whole branch), so its
             // `#{pane_start_command}` is the empty string — the wrapper the
@@ -1131,6 +1131,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
+    apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     // new-window -e KEY=VALUE (#489): pane-scoped env, applied last so it
     // overrides the session environment, matching tmux.
     for (k, v) in extra_env { shell_cmd.env(k, v); }
@@ -1177,7 +1178,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, window_options: Default::default(), activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -1525,6 +1526,8 @@ pub struct WarmSpawnParams {
     pub claude_code_force_interactive: bool,
     pub host_colors: Option<crate::types::HostColors>,
     pub environment: std::collections::HashMap<String, String>,
+    /// Names a child must not inherit (`set-environment -r` / `-h`, #775).
+    pub env_removals: Vec<String>,
     pub history_limit: usize,
     pub allow_alternate_screen: bool,
 }
@@ -1560,6 +1563,7 @@ pub fn warm_spawn_params(app: &mut AppState) -> Option<WarmSpawnParams> {
         claude_code_force_interactive: app.claude_code_force_interactive,
         host_colors: app.host_colors.clone(),
         environment: app.environment.clone(),
+        env_removals: app.env_scopes.child_removals(&app.environment),
         history_limit: app.history_limit,
         allow_alternate_screen: app.allow_alternate_screen,
     })
@@ -1584,7 +1588,14 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
     set_tmux_env(&mut shell_cmd, pane_id, p.control_port, p.socket_name.as_deref(), &p.session_name, p.claude_code_fix_tty, p.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, p.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &p.environment);
+    apply_env_removals(&mut shell_cmd, &p.env_removals);
     let spawn_cwd = shell_cmd.get_cwd().cloned();
+    // A teardown that began while this thread was opening the pty: do not
+    // create a shell now. Creating it would only make the reaper wait out a
+    // whole CreateProcessW for a spare nobody will ever claim (#686).
+    if crate::warm_pane_sync::inflight::is_tearing_down() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "server is shutting down; spare not spawned"));
+    }
     let t_spawn0 = std::time::Instant::now();
     let child = pair.slave
         .spawn_command(shell_cmd)
@@ -1672,6 +1683,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
+    apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -1708,7 +1720,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw_argv(raw_args), cwd_hint: None };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw_argv(raw_args), cwd_hint: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, window_options: Default::default(), activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![raw_pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -1919,7 +1931,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
             let spare_cwd = wp.spawn_cwd.take();
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
-            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
+            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell,
             // in the dialect that shell speaks (#600), unless it was started in
             // that directory (spare_needs_rehome).
@@ -1966,6 +1978,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
+    apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     // split-window -e KEY=VALUE (#489): pane-scoped env, applied last so it
     // overrides the session environment, matching tmux.
     for (k, v) in extra_env { shell_cmd.env(k, v); }
@@ -1998,7 +2011,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, input_off: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()), start_command: start_command_raw(command), cwd_hint: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -2215,6 +2228,15 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
 pub fn apply_user_environment(builder: &mut CommandBuilder, environment: &std::collections::HashMap<String, String>) {
     for (key, value) in environment {
         builder.env(key, value);
+    }
+}
+
+/// Drop every name a new child must not inherit (`set-environment -r` and
+/// hidden entries, #775) from the final environment block, whatever put it
+/// there: the server process environment or the registry fill (#773).
+pub fn apply_env_removals(builder: &mut CommandBuilder, names: &[String]) {
+    for name in names {
+        builder.env_remove(name);
     }
 }
 
@@ -3397,6 +3419,132 @@ fn scan_rmcup(data: &[u8]) -> bool {
     data.windows(RMCUP.len()).any(|w| w == RMCUP)
 }
 
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+/// The shared head of `ESC[?2026h` and `ESC[?2026l`.
+const SYNC_MARKER_HEAD: &[u8] = b"\x1b[?2026";
+/// tmux gives up on an unterminated synchronized update after one second
+/// (screen-write.c, screen_write_start_sync).
+const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bound on what one unterminated update may hold back.
+const SYNC_MAX_HELD: usize = 4 * 1024 * 1024;
+
+/// Next `ESC[?2026h` (true) or `ESC[?2026l` (false) at or after `from`.
+/// One ESC search per escape sequence, so a batch without any is one pass.
+fn find_sync_marker(data: &[u8], from: usize) -> Option<(usize, bool)> {
+    let n = SYNC_BEGIN.len();
+    let mut i = from;
+    while i + n <= data.len() {
+        let p = i + data[i..].iter().position(|&c| c == 0x1b)?;
+        if p + n > data.len() { return None; }
+        if &data[p..p + n - 1] == SYNC_MARKER_HEAD {
+            match data[p + n - 1] {
+                b'h' => return Some((p, true)),
+                b'l' => return Some((p, false)),
+                _ => {}
+            }
+        }
+        i = p + 1;
+    }
+    None
+}
+
+/// Synchronized output (DECSET 2026).  Once a program sends `ESC[?2026h`,
+/// its output is held back until `ESC[?2026l` arrives or `SYNC_TIMEOUT`
+/// expires, then released to the parser in one batch.  Without this the
+/// render path can snapshot a half-drawn frame, which shows up as a flashing
+/// cursor and torn redraws while a TUI such as Claude Code repaints.
+///
+/// tmux keeps parsing and defers only its redraw to the outer terminal
+/// (screen-write.c, MODE_SYNC).  A psmux client renders a full snapshot of
+/// the parser, so holding the bytes is how the same frame atomicity is had
+/// here.  The one thing that would otherwise change, a query inside the
+/// update waiting a whole second for its reply, is handled by `feed`'s
+/// `flush`.
+///
+/// A begin marker split across two reads is not detected (that frame is
+/// simply not held); an end marker split across reads is, because each new
+/// batch is scanned together with the last few held bytes.  Only new bytes
+/// are scanned, so a flood inside an open update stays linear.
+pub(crate) struct SyncGate {
+    held: Vec<u8>,
+    /// An update is open: everything from `held[0]` on is held.  `held` can
+    /// be empty while open, after a query forced a release.
+    open: bool,
+    since: Instant,
+}
+
+impl SyncGate {
+    pub(crate) fn new() -> Self {
+        Self { held: Vec::new(), open: false, since: Instant::now() }
+    }
+
+    /// Whether a synchronized update is in progress (DECRQM 2026 answers 1).
+    pub(crate) fn is_open(&self) -> bool { self.open }
+
+    /// Time left before the open update must be released; `None` when none is open.
+    pub(crate) fn time_left(&self, now: Instant) -> Option<Duration> {
+        if !self.open { return None; }
+        Some(SYNC_TIMEOUT.saturating_sub(now.saturating_duration_since(self.since)))
+    }
+
+    /// Everything still held, for a pane that is going away.
+    pub(crate) fn take_all(&mut self) -> Vec<u8> {
+        self.open = false;
+        std::mem::take(&mut self.held)
+    }
+
+    /// Takes a new batch, returns the bytes the parser should process now.
+    ///
+    /// `flush` releases everything at once but leaves the update open: the
+    /// batch carries a query (DA, DSR, CPR, DECRQM) the program is blocked
+    /// on, and it will not send `ESC[?2026l` before it has the reply.  tmux
+    /// answers such a query straight away because it never stops parsing.
+    pub(crate) fn feed(&mut self, bytes: Vec<u8>, now: Instant, flush: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.open && now.saturating_duration_since(self.since) >= SYNC_TIMEOUT {
+            self.open = false;
+            out = std::mem::take(&mut self.held);
+        }
+        if !self.open && find_sync_marker(&bytes, 0).is_none() {
+            if out.is_empty() { return bytes; }
+            out.extend_from_slice(&bytes);
+            return out;
+        }
+        let (mut data, scan_from) = if self.held.is_empty() {
+            (bytes, 0)
+        } else {
+            let from = self.held.len().saturating_sub(SYNC_BEGIN.len() - 1);
+            let mut d = std::mem::take(&mut self.held);
+            d.extend_from_slice(&bytes);
+            (d, from)
+        };
+        let mut open_at = if self.open { Some(0) } else { None };
+        let mut i = scan_from;
+        while let Some((p, begin)) = find_sync_marker(&data, i) {
+            if begin {
+                if open_at.is_none() {
+                    open_at = Some(p);
+                    self.since = now;
+                }
+            } else {
+                open_at = None;
+            }
+            i = p + SYNC_BEGIN.len();
+        }
+        self.open = match open_at {
+            Some(_) if flush => true,
+            Some(at) if data.len() - at <= SYNC_MAX_HELD => {
+                self.held = data.split_off(at);
+                true
+            }
+            _ => false,
+        };
+        if out.is_empty() { return data; }
+        out.extend_from_slice(&data);
+        out
+    }
+}
+
 /// Returns true if `data` contains a Cursor Position Request (ESC[6n).
 /// ConPTY children (e.g. pwsh) emit this at startup and after session events
 /// such as lock/unlock.  The host must respond with ESC[row;colR or the
@@ -3584,6 +3732,8 @@ pub(crate) struct DecrqmState {
     pub mouse_all: bool,
     pub mouse_utf8: bool,
     pub mouse_sgr: bool,
+    /// A synchronized update (DECSET 2026) is open in the pane's `SyncGate`.
+    pub synchronized_output: bool,
 }
 
 impl DecrqmState {
@@ -3598,6 +3748,7 @@ impl DecrqmState {
             mouse_all: s.mouse_all_flag(),
             mouse_utf8: s.mouse_utf8_flag(),
             mouse_sgr: s.mouse_sgr_flag(),
+            synchronized_output: false,
         }
     }
 }
@@ -3617,13 +3768,14 @@ fn decrqm_private_value(mode: u16, st: &DecrqmState) -> u8 {
         1005 => onoff(st.mouse_utf8),
         1006 => onoff(st.mouse_sgr),
         2004 => onoff(st.bracketed_paste),
-        // 2026 (synchronized output) is deliberately 0, not 2.  tmux answers 2
-        // because tmux implements MODE_SYNC; psmux's vt100 has no synchronized
-        // output, so claiming the mode exists would invite programs to bracket
-        // every frame with a sequence psmux drops on the floor.  0 is also
-        // byte for byte what the inbox console host answers on 26200
-        // (measured: `ESC[?2026;0$y`), so a pane sees the same reply whichever
-        // console host is under it.  The same reasoning covers 2031.
+        // 2026 (synchronized output) answers like tmux (input.c, case 2026:
+        // MODE_SYNC ? 1 : 2).  The parser thread holds a pane's output
+        // between `ESC[?2026h` and `ESC[?2026l` (see `SyncGate`), so this is
+        // 1 while an update is open and 2 otherwise.  Only a console host
+        // that forwards the query (OpenConsole via PSMUX_CONPTY_DIR) lets
+        // psmux answer it; the inbox host on 26200 answers 0 itself and
+        // swallows the query.  2031 stays 0.
+        2026 => onoff(st.synchronized_output),
         _ => 0,
     }
 }
@@ -4172,6 +4324,8 @@ pub fn spawn_reader_thread(
         // palette, so a pane id reused by respawn-pane withdraws whatever the
         // previous child published the moment its successor writes anything.
         let mut published_palette_gen: u64 = u64::MAX;
+        // DECSET 2026: output held back between `ESC[?2026h` and `ESC[?2026l`.
+        let mut sync_gate = SyncGate::new();
         loop {
             // Wait for at least one byte (or shutdown).
             {
@@ -4185,7 +4339,13 @@ pub fn spawn_reader_thread(
                         // Reader is gone and nothing left to drain — exit
                         // after running alt-screen cleanup below.
                         drop(buf);
+                        let held = sync_gate.take_all();
                         if let Ok(mut parser) = term_reader.lock() {
+                            if !held.is_empty() {
+                                parser.process(&held);
+                                dv_writer.fetch_add(1, Ordering::Release);
+                                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+                            }
                             if parser.screen().alternate_screen() {
                                 parser.process(b"\x1b[?25h\x1b[?1049l");
                                 cursor_shape.store(0, Ordering::Release);
@@ -4195,7 +4355,14 @@ pub fn spawn_reader_thread(
                         }
                         return;
                     }
-                    let res = cv.wait_timeout(buf, Duration::from_millis(100));
+                    // A held synchronized update must be released on time even
+                    // if the pane goes quiet; the gate below does the release.
+                    let wait = match sync_gate.time_left(Instant::now()) {
+                        Some(left) if left.is_zero() => break,
+                        Some(left) => left.min(Duration::from_millis(100)),
+                        None => Duration::from_millis(100),
+                    };
+                    let res = cv.wait_timeout(buf, wait);
                     buf = match res {
                         Ok((g, _)) => g,
                         Err(_) => return,
@@ -4243,6 +4410,15 @@ pub fn spawn_reader_thread(
                     Err(_) => break,
                 }
             };
+            // The query scanners see every byte as it arrives, BEFORE the
+            // synchronized output gate: a program that asks a question inside
+            // an open update is blocked on the answer and will not close the
+            // update first, so the gate must not sit on the question for its
+            // one second timeout (PR #781).  A query releases what is held.
+            let has_cpr_query = cpr_scanner.scan(&bytes);
+            let device_queries = device_scanner.scan(&bytes);
+            let flush = has_cpr_query || !device_queries.is_empty();
+            let bytes = sync_gate.feed(bytes, Instant::now(), flush);
             if bytes.is_empty() { continue; }
 
             // Scan for cursor shape and RMCUP on the raw batch BEFORE
@@ -4251,8 +4427,6 @@ pub fn spawn_reader_thread(
                 cursor_shape.store(shape, Ordering::Release);
             }
             let rmcup = scan_rmcup(&bytes);
-            let has_cpr_query = cpr_scanner.scan(&bytes);
-            let device_queries = device_scanner.scan(&bytes);
 
             // Issue #502 diagnostic: capture the exact pre-parse byte stream
             // when PSMUX_PANE_RAW=1. Off by default, one atomic load when off.
@@ -4265,7 +4439,9 @@ pub fn spawn_reader_thread(
             if let Ok(mut parser) = term_reader.lock() {
                 parser.process(&bytes);
                 if !device_queries.is_empty() {
-                    decrqm_state = Some(DecrqmState::from_screen(parser.screen()));
+                    let mut st = DecrqmState::from_screen(parser.screen());
+                    st.synchronized_output = sync_gate.is_open();
+                    decrqm_state = Some(st);
                 }
                 if parser.screen_mut().take_audible_bell() {
                     bell_pending.store(true, Ordering::Release);
@@ -4327,6 +4503,10 @@ pub fn spawn_reader_thread(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_sync_output_gate.rs"]
+mod test_sync_output_gate;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue597_xtversion_reply.rs"]

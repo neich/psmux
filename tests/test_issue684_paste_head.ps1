@@ -70,6 +70,22 @@ if (-not (Test-Path $recorder) -or -not (Test-Path $inj)) {
 
 $ESC = [char]27   # NOT `e: Windows PowerShell 5.1 reads that as the letter e.
 
+# Set-Clipboard does not report a clipboard another window is holding open: the
+# old contents stay and the client, correctly, finds the typed text is not the
+# clipboard's head and flushes every character as typing.  That is the shape of
+# a split paste, so the gesture must not start until the clipboard really holds
+# what the test is about to inject.
+function Set-ClipboardVerified([string]$Value) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { Set-Clipboard -Value $Value -EA Stop } catch {}
+        Start-Sleep -Milliseconds 100
+        $now = try { (Get-Clipboard -Raw -EA Stop) } catch { $null }
+        if ($null -ne $now -and $now.TrimEnd("`r", "`n") -eq $Value) { return $true }
+    }
+    return $false
+}
+
 # One gesture against a REAL attached client, with the recorder as the pane
 # child so the assertion is on the bytes, not on the screen.
 function Invoke-Gesture {
@@ -82,7 +98,7 @@ function Invoke-Gesture {
     $log = Join-Path $root "rec_$Tag.log"
     Remove-Item $log -EA SilentlyContinue
     $sess = "i684h_$Tag"
-    $res = [ordered]@{ Text = ""; Total = -1; Has200 = "?"; Has201 = "?"; Flush = 0; Hold = 0; Rc = -1; Attached = $false }
+    $res = [ordered]@{ Text = ""; Total = -1; Has200 = "?"; Has201 = "?"; Flush = 0; Hold = 0; Rc = -1; Attached = $false; ClipSet = $false }
 
     & $PSMUX -L $NS new -d -s $sess -x 100 -y 30 -- $recorder $log 22 vt 2>&1 | Out-Null
     Start-Sleep -Seconds 3
@@ -94,7 +110,8 @@ function Invoke-Gesture {
     }
     if ($res.Attached) {
         Start-Sleep -Seconds 2
-        Set-Clipboard -Value $Clip
+        $res.ClipSet = Set-ClipboardVerified $Clip
+        if (-not $res.ClipSet) { Write-Info "[$Tag] the clipboard never took the test text in 5 s; it holds '$(try { Get-Clipboard -Raw } catch { '?' })'" }
         Start-Sleep -Milliseconds 250
         $env:PSMUX_INJECT_GAP_MS = "$Gap"
         & $inj $client.Id $Mode 150 $Text
@@ -130,6 +147,8 @@ if (-not $drip.Attached) {
     Write-Skip "no client attached, nothing measurable"
 } elseif ($drip.Rc -eq 2) {
     Write-Skip "AttachConsole refused from this shell (run the suite from a real console)"
+} elseif (-not $drip.ClipSet) {
+    Write-Skip "the clipboard never held the payload, so the burst was not a paste of it"
 } else {
     if ($drip.Text -eq $wantBracketed) {
         Write-Pass "all $($payload.Length) characters arrived INSIDE the brackets ($($drip.Total) bytes)"
@@ -191,6 +210,79 @@ if (-not $cost.Attached -or $cost.Rc -eq 2) {
     else { Write-Fail "a held keystroke was bracketed" }
     if ($cost.Hold -le 1) { Write-Pass "only the matching character was held ($($cost.Hold))" }
     else { Write-Fail "$($cost.Hold) characters were held, expected at most 1" }
+}
+
+Write-Host "`n=== a moment of clipboard contention must not poison later pastes ===" -ForegroundColor Yellow
+# One attached client.  Paste 1 is dripped while another window holds the
+# clipboard open, so the client cannot read its head.  The holder lets go and
+# paste 2 of the SAME clipboard (same sequence number) is dripped.  Before the
+# fix the refused read was cached as "no text" for that sequence number and
+# paste 2 arrived as 43 typed characters with no brackets.
+#
+# The holder must open the clipboard with a real window: OpenClipboard(NULL)
+# does not stop another process opening it, so it would hold nothing.
+& $PSMUX -L $NS kill-server 2>&1 | Out-Null
+Start-Sleep -Milliseconds 500
+$dbg = Join-Path $env:PSMUX_DATA_DIR "input_debug.log"
+Remove-Item $dbg -EA SilentlyContinue
+$clog = Join-Path $root "rec_contend.log"
+$flag = Join-Path $root "holding.flag"
+$holder = Join-Path $root "clip_holder.ps1"
+@'
+param([string]$Flag, [int]$HoldMs)
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -Namespace H684 -Name C -MemberDefinition '[DllImport("user32.dll")] public static extern bool OpenClipboard(System.IntPtr h); [DllImport("user32.dll")] public static extern bool CloseClipboard();'
+$form = New-Object System.Windows.Forms.Form
+if ([H684.C]::OpenClipboard($form.Handle)) { Set-Content $Flag 'held'; Start-Sleep -Milliseconds $HoldMs; [H684.C]::CloseClipboard() | Out-Null; Set-Content $Flag 'released' }
+else { Set-Content $Flag 'openfailed' }
+$form.Dispose()
+'@ | Set-Content $holder
+$csess = "i684h_contend"
+& $PSMUX -L $NS new -d -s $csess -x 100 -y 30 -- $recorder $clog 40 vt 2>&1 | Out-Null
+Start-Sleep -Seconds 3
+$cclient = Start-Process -FilePath $PSMUX -ArgumentList "-L", $NS, "attach-session", "-t", $csess -PassThru -WindowStyle Normal
+$sw = [Diagnostics.Stopwatch]::StartNew(); $catt = $false
+while ($sw.ElapsedMilliseconds -lt 15000) {
+    if (((& $PSMUX -L $NS display-message -t $csess -p '#{session_attached}') -join '').Trim() -eq '1') { $catt = $true; break }
+    Start-Sleep -Milliseconds 100
+}
+$cclipOk = $false; $held = ""; $rc2 = -1
+if ($catt) {
+    Start-Sleep -Seconds 2
+    $cclipOk = Set-ClipboardVerified $payload
+    Start-Sleep -Milliseconds 250
+    $shellExe = (Get-Process -Id $PID).Path
+    $hp = Start-Process $shellExe -ArgumentList '-NoProfile', '-File', $holder, '-Flag', $flag, '-HoldMs', 1500 -PassThru -WindowStyle Hidden
+    $sw.Restart(); while (-not (Test-Path $flag) -and $sw.ElapsedMilliseconds -lt 15000) { Start-Sleep -Milliseconds 20 }
+    $held = (Get-Content $flag -EA SilentlyContinue) -join ''
+    $env:PSMUX_INJECT_GAP_MS = "2"
+    & $inj $cclient.Id drip 150 $payload | Out-Null
+    $hp.WaitForExit(15000) | Out-Null
+    $held = (Get-Content $flag -EA SilentlyContinue) -join ''
+    Start-Sleep -Seconds 2
+    & $inj $cclient.Id type 150 "|" | Out-Null
+    Start-Sleep -Seconds 1
+    & $inj $cclient.Id drip 150 $payload | Out-Null
+    $rc2 = $LASTEXITCODE
+    Start-Sleep -Seconds 4
+}
+try { if (-not $cclient.HasExited) { Stop-Process -Id $cclient.Id -Force -EA SilentlyContinue } } catch {}
+# The recorder writes its log when its 40 s window closes.
+$sw.Restart(); while (-not ((Test-Path $clog) -and (Select-String -Path $clog -Pattern '^TEXT ' -Quiet)) -and $sw.ElapsedMilliseconds -lt 45000) { Start-Sleep -Milliseconds 500 }
+$ctext = ""
+foreach ($l in Get-Content $clog -EA SilentlyContinue) { if ($l -match '^TEXT (.*)$') { $ctext = $Matches[1] } }
+$busy = if (Test-Path $dbg) { @(Get-Content $dbg | Where-Object { $_ -match 'clipboard busy' }).Count } else { 0 }
+& $PSMUX -L $NS kill-session -t $csess 2>&1 | Out-Null
+if (-not $catt -or $rc2 -eq 2) {
+    Write-Skip "contention arm not measurable on this host"
+} elseif (-not $cclipOk -or $held -ne 'released') {
+    Write-Skip "could not stage the contention (clipboard set: $cclipOk, holder: '$held')"
+} else {
+    if ($busy -ge 1) { Write-Pass "the client met the held clipboard and did not cache the refusal ($busy busy read(s))" }
+    else { Write-Info "the client never read the clipboard while it was held (no busy line); paste 1 did not exercise the refusal" }
+    $second = ($ctext -split '\|', 2)[1]
+    if ($second -eq $wantBracketed) { Write-Pass "the paste after the contention arrived whole and bracketed" }
+    else { Write-Fail "the paste after the contention was split: '$second' (whole record: '$ctext')" }
 }
 
 & $PSMUX -L $NS kill-server 2>&1 | Out-Null

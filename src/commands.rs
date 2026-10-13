@@ -391,13 +391,12 @@ fn generate_list_panes(app: &AppState) -> String {
     output
 }
 
-/// Generate list-clients output from AppState.
+/// Generate list-clients output from AppState: one row per registered client,
+/// the same rows `CtrlReq::ListClients` answers over the wire (#724). This used
+/// to print a single made up `/dev/pts/0` row whatever was attached
+/// (discussion #776).
 fn generate_list_clients(app: &AppState) -> String {
-    format!("/dev/pts/0: {}: {} [{}x{}] (utf8)\n",
-        app.session_name,
-        app.windows[app.active_idx].name,
-        app.client_area.width,
-        app.client_area.height)
+    crate::format::format_list_clients(app, crate::format::default_list_clients_format(), None)
 }
 
 /// Generate show-hooks output from AppState.
@@ -758,6 +757,8 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
             }
         }
         "last-window" | "last" => Some(Action::Command("last-window".to_string())),
+        // Keep the flags: `last-pane -d` / `-e` toggle input, not select.
+        "last-pane" | "lastp" if parts.len() > 1 => Some(Action::Command(cmd.to_string())),
         "last-pane" | "lastp" => Some(Action::Command("last-pane".to_string())),
         "swap-pane" | "swapp" => Some(Action::Command(cmd.to_string())),
         "resize-pane" | "resizep" => Some(Action::Command(cmd.to_string())),
@@ -1255,6 +1256,21 @@ pub(crate) fn paste_buffer_payload(text: &str, pb: &PasteBufferArgs) -> String {
     apply_separator(text, pb.effective_separator())
 }
 
+/// The `-t` of an in-server `select-pane -d/-e` or `last-pane -d/-e`, in the
+/// shape `server::set_pane_input_off` resolves.
+fn input_toggle_temp_target(raw_target: Option<&str>) -> Option<crate::types::TempTarget> {
+    raw_target.map(|t| {
+        let pt = crate::cli::parse_target(t);
+        crate::types::TempTarget {
+            win: pt.window,
+            win_is_id: pt.window_is_id,
+            win_name: pt.window_name,
+            pane: pt.pane,
+            pane_is_id: pt.pane_is_id,
+        }
+    })
+}
+
 /// Write a `paste-buffer` payload to the active pane.  Neither route rewrites
 /// line endings again: `-p` uses the verbatim paste writer, plain text the
 /// send-keys text path, so `-r` keeps its LF and a CR in the buffer stays a CR,
@@ -1262,6 +1278,14 @@ pub(crate) fn paste_buffer_payload(text: &str, pb: &PasteBufferArgs) -> String {
 fn deliver_paste_buffer(app: &mut AppState, text: &str, pb: &PasteBufferArgs) -> io::Result<()> {
     let payload = paste_buffer_payload(text, pb);
     if payload.is_empty() {
+        return Ok(());
+    }
+    // select-pane -d: cmd-paste-buffer.c writes only `if (~wp->flags &
+    // PANE_INPUTOFF)`, and that is not an error (a `-d` still deletes the
+    // buffer, in the caller).  Checked here and not just in the writers
+    // below because a pane in copy mode would otherwise take the text as
+    // copy mode keys, where tmux writes nothing at all.
+    if !crate::input::input_target_accepts_input(app) {
         return Ok(());
     }
     if pb.bracket {
@@ -1621,6 +1645,17 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "select-pane" | "selectp" => {
+            // select-pane -d / -e (tmux PANE_INPUTOFF) from a key binding,
+            // hook, menu or the command prompt: the same rule and the same
+            // server helper as the client routes, selecting nothing.
+            // The getopt walk, so a clustered `-dt %1` names %1 here too.
+            let raw_target = crate::server::connection::select_pane_target_arg(&parts[1..]);
+            if let Some((off, last)) = crate::server::connection::select_pane_input_toggle(&parts[1..], raw_target) {
+                if let Err(e) = crate::server::set_pane_input_off(app, input_toggle_temp_target(raw_target).as_ref(), off, last) {
+                    app.status_message = Some((e, Instant::now(), None));
+                }
+                return Ok(());
+            }
             // Save/restore copy mode across pane switches (tmux parity #43)
             let is_last = parts.iter().any(|p| *p == "-l");
             if is_last {
@@ -1703,6 +1738,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 });
             }
         }
+        "last-pane" | "lastp" if crate::server::connection::last_pane_input_toggle(&parts[1..]).is_some() => {
+            // last-pane -d / -e: select-pane -l -d / -e (cmd-select-pane.c
+            // runs last-pane through the same -l branch), selecting nothing.
+            let off = crate::server::connection::last_pane_input_toggle(&parts[1..]).unwrap_or(true);
+            let raw_target = crate::server::connection::select_pane_target_arg(&parts[1..]);
+            if let Err(e) = crate::server::set_pane_input_off(app, input_toggle_temp_target(raw_target).as_ref(), off, true) {
+                app.status_message = Some((e, Instant::now(), None));
+            }
+        }
         "last-pane" | "lastp" => {
             let target = crate::server::last_pane_path(app);
             match target {
@@ -1770,7 +1814,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             {
                 // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
                 if let Some(win) = app.windows.get_mut(app.active_idx) {
-                    if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                    // A PageUp KEY for the program: not for an input-off pane.
+                    if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path).filter(|p| p.accepts_input()) {
                         let _ = pane.writer.write_all(b"\x1b[5~");
                     }
                 }
@@ -1853,6 +1898,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     app.next_pane_id,
                     "1", // session name not available in local mode
                     &app.environment,
+                    &app.env_scopes.child_removals(&app.environment),
                     app.host_colors.as_ref(),
                 )
             } else { None };
@@ -2006,6 +2052,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "send-keys" | "send" => {
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            } else if !crate::input::active_tiled_accepts_input(app) {
+                // select-pane -d (tmux PANE_INPUTOFF): the keys go nowhere.
             } else {
                 // Local: write key text directly to active pane
                 let literal = parts.iter().any(|p| *p == "-l");
@@ -2430,19 +2478,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let has_u = parts.iter().any(|p| *p == "-u");
-                let non_flag: Vec<&str> = parts[1..].iter().filter(|p| !p.starts_with('-')).copied().collect();
-                if has_u {
-                    if let Some(key) = non_flag.first() {
-                        app.environment.remove(*key);
-                        std::env::remove_var(key);
-                    }
-                } else if non_flag.len() >= 2 {
-                    app.environment.insert(non_flag[0].to_string(), non_flag[1].to_string());
-                    std::env::set_var(non_flag[0], non_flag[1]);
-                } else if non_flag.len() == 1 {
-                    app.environment.insert(non_flag[0].to_string(), String::new());
-                    std::env::set_var(non_flag[0], "");
+                // Same parser and semantics as the server (#775). The
+                // arguments are split quote aware: `parts` is a plain
+                // whitespace split, so `NAME "a b"` reached the parser as
+                // three tokens with the quotes still on them.
+                let args = parse_command_line(cmd);
+                let args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+                match crate::environ::parse_set_environment(&args) {
+                    Ok(parsed) => crate::environ::apply_set(&mut app.environment, &mut app.env_scopes, &parsed),
+                    Err(e) => app.status_message = Some((e, std::time::Instant::now(), None)),
                 }
             }
         }
@@ -2450,12 +2494,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let mut output = String::new();
-                for (key, value) in &app.environment {
-                    output.push_str(&format!("{}={}\n", key, value));
+                let args = parse_command_line(cmd);
+                let args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+                match crate::environ::parse_show_environment(&args)
+                    .and_then(|a| crate::environ::show(&app.environment, &app.env_scopes, &a))
+                {
+                    Ok(output) if output.is_empty() => show_output_popup(app, "show-environment", "(no environment variables)\n".to_string()),
+                    Ok(output) => show_output_popup(app, "show-environment", output),
+                    Err(e) => app.status_message = Some((e, std::time::Instant::now(), None)),
                 }
-                if output.is_empty() { output.push_str("(no environment variables)\n"); }
-                show_output_popup(app, "show-environment", output);
             }
         }
         "set-hook" => {
@@ -2509,7 +2556,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 };
                 if !encoded.is_empty() {
                     if let Some(win) = app.windows.get_mut(app.active_idx) {
-                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                        // send-prefix is a key (tmux window_pane_key), so an
+                        // input-off pane does not get it.
+                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path).filter(|p| p.accepts_input()) {
                             let _ = p.writer.write_all(&encoded);
                             let _ = p.writer.flush();
                         }
@@ -2532,17 +2581,26 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     let condition = positional[0];
                     let true_cmd = positional[1];
                     let false_cmd = positional.get(2).copied();
+                    // The shell command is format expanded before it runs,
+                    // like tmux (cmd-if-shell.c:86 format_single_from_target);
+                    // untimed, because a `%` in a shell command is not
+                    // strftime (issue #734 follow up).
+                    let shell_condition = if format_mode {
+                        String::new()
+                    } else {
+                        crate::format::expand_format_untimed(condition, app)
+                    };
                     let success = if format_mode {
                         let expanded = crate::format::expand_format(condition, app);
                         !expanded.is_empty() && expanded != "0"
-                    } else if condition == "true" || condition == "1" {
+                    } else if shell_condition == "true" || shell_condition == "1" {
                         true
-                    } else if condition == "false" || condition == "0" {
+                    } else if shell_condition == "false" || shell_condition == "0" {
                         false
                     } else {
                         {
                             let (shell_prog, mut shell_args) = resolve_run_shell();
-                            shell_args.push(condition.to_string());
+                            shell_args.push(shell_condition);
                             let mut cmd = std::process::Command::new(&shell_prog);
                             cmd.args(shell_args)
                             .stdout(std::process::Stdio::null())
@@ -3098,7 +3156,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             app.status_message = Some(("suspend: not available on Windows".to_string(), Instant::now(), None));
         }
         "choose-client" => {
-            app.status_message = Some(("choose-client: single-client model (you are the only client)".to_string(), Instant::now(), None));
+            // psmux has no client mode yet; show the attached clients, as the
+            // wire path does (`ShowTextPopup("choose-client", ...)`). The old
+            // status line claimed a single client model, which psmux is not:
+            // every client is in `client_registry` (discussion #776).
+            let output = generate_list_clients(app);
+            show_output_popup(app, "choose-client", output);
         }
         "customize-mode" => {
             // tmux 3.2+ customize-mode: interactive options editor
@@ -3147,7 +3210,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 // status message, no log line. Only `-c`/`-d` start-dirs were
                 // being expanded (in server/mod.rs), which is why `popup -d
                 // "#{pane_current_path}"` worked and this did not.
-                let shell_cmd = crate::format::expand_format(&shell_cmd, app);
+                //
+                // Untimed, like tmux's format_expand: a `%` in a shell
+                // command (cmd's %VAR%, PowerShell's `%`) is not strftime.
+                let shell_cmd = crate::format::expand_format_untimed(&shell_cmd, app);
                 // Expand ~ to home directory + XDG fallback for plugin paths
                 let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd);
                 // Set PSMUX_TARGET_SESSION so child scripts connect to the correct server
@@ -3398,3 +3464,7 @@ mod test_issue725_join_pane_focus;
 #[cfg(test)]
 #[path = "../tests-rs/test_cross_session_source_targets.rs"]
 mod test_cross_session_source_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_disc776_in_process_clients.rs"]
+mod test_disc776_in_process_clients;

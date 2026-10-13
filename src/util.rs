@@ -477,7 +477,8 @@ pub fn list_windows_tmux(app: &AppState) -> String {
     let mut lines = Vec::new();
     for (i, w) in app.windows.iter().enumerate() {
         let flag = if i == app.active_idx { "*" } else if w.activity_flag { "#" } else { "-" };
-        let pane_count = count_panes(&w.root);
+        // The window's floats are panes of it, the way tmux counts them.
+        let pane_count = count_panes(&w.root) + w.floating.len();
         let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
             (p.last_cols, p.last_rows)
         } else { (120, 30) };
@@ -497,6 +498,13 @@ pub fn list_tree_json(app: &AppState) -> io::Result<String> {
     for (i, w) in app.windows.iter().enumerate() {
         let mut panes = Vec::new();
         collect_panes(&w.root, &mut panes);
+        // The window's floats are panes of it, so `choose-tree` lists them.
+        // tmux walks one pane list per window and a float is in it, which is
+        // why its tree shows a float and this one did not.
+        panes.extend(w.floating.iter().map(|fp| PaneInfo {
+            id: fp.pane.id,
+            title: if fp.title.is_empty() { fp.pane.title.clone() } else { fp.title.clone() },
+        }));
         v.push(WinTree { id: w.id, name: w.name.clone(), active: i == app.active_idx, panes, idx: app.win_display_index(i) });
     }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
@@ -699,11 +707,51 @@ pub fn quote_arg_if_needed(s: &str) -> String {
         || s.chars().any(char::is_whitespace)
         || s.contains('"')
         || s.contains('\'')
+        // An argv element ending in `;` is data on the CLI route (only a
+        // lone `;` separates there, cli::split_cli_command_list), but bare on
+        // the wire the server's splitter now reads `word;` as the end of a
+        // command, as tmux's command string lexer does (#734 follow up).
+        // Quoted it stays one argument. A lone `;` is a separator either way
+        // and a modified `;` key (`M-;`) is left raw for bind-key.
+        || (s.len() > 1 && s.ends_with(';') && !s.ends_with("\\;")
+            && !crate::config::is_modified_semicolon_key(s))
     {
         quote_arg(s)
     } else {
         s.to_string()
     }
+}
+
+/// The wire line for a CLI `bind-key` argv (`argv[0]` is the command name).
+///
+/// tmux keeps every argument of the bound command as its own argument, so
+/// `bind-key Y if-shell 'cond' 'set -g @k yes' 'set -g @k no'` binds an
+/// if-shell with three arguments. Joining argv with spaces flattened it to
+/// `if-shell cond set -g @k yes set -g @k no`, which no longer means anything.
+/// So each argument that needs it is quoted, EXCEPT when the bound command is
+/// one single argument: that one is a command string (tmux parses a lone
+/// argument as a command list, `bind x "split-window -h"`), and goes raw.
+pub fn bind_key_wire_line<S: AsRef<str>>(argv: &[S]) -> String {
+    let argv: Vec<&str> = argv.iter().map(|s| s.as_ref()).collect();
+    // Skip bind-key's own flags to find the key; what follows is the command.
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i] {
+            "-T" | "-N" => i += 2,
+            a if a.starts_with('-') && a.len() > 1 && a != "--" => i += 1,
+            "--" => { i += 1; break; }
+            _ => break,
+        }
+    }
+    let tail_start = i + 1; // argv[i] is the key
+    let single_tail = argv.len() == tail_start + 1;
+    argv.iter().enumerate().map(|(n, a)| {
+        if n == 0 || (single_tail && n == tail_start) {
+            a.to_string()
+        } else {
+            quote_arg_if_needed(a)
+        }
+    }).collect::<Vec<String>>().join(" ")
 }
 
 /// Parse the canonical tmux logging idiom `cat > <path>` / `cat >> <path>`

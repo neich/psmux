@@ -239,7 +239,7 @@ fn paste_states_do_not_zero_latency_flush() {
 #[test]
 fn the_first_character_of_a_clipboard_paste_is_held() {
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
@@ -248,14 +248,14 @@ fn the_first_character_of_a_clipboard_paste_is_held() {
 fn a_burst_under_an_open_ctrl_v_gesture_is_held_whatever_the_clipboard_says() {
     // Hosts that forward the Ctrl+V press give the client the stronger
     // signal; the clipboard may even be unreadable at that instant.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::ZERO };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::ZERO, shifted_head: false };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
 #[cfg(windows)]
 #[test]
 fn a_character_that_is_not_the_clipboard_head_still_flushes_immediately() {
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some("Microsoft"), held_for: Duration::ZERO };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false };
     assert!(should_zero_latency_flush_paste_pend("x", true, false, false, ev));
     // The second character of a burst is judged on its own pending buffer,
     // which is why typing after the held head is not delayed as well.
@@ -268,7 +268,7 @@ fn a_clipboard_of_one_or_two_characters_never_holds() {
     // At two characters or fewer both paths end in the same `send-text`, so
     // holding would buy nothing and cost the 20 ms window.
     for clip in ["a", "ab"] {
-        let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO };
+        let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::ZERO, shifted_head: false };
         assert!(should_zero_latency_flush_paste_pend("a", true, false, false, ev));
     }
 }
@@ -282,11 +282,11 @@ fn a_lone_clipboard_head_is_released_as_typing_after_the_short_hold() {
     // keystroke that happens to match the clipboard, and it goes out as
     // typing 3 ms late rather than 20 (keystroke gate p99 23 ms otherwise).
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let early = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(2) };
+    let early = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(2), shifted_head: false };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, early));
-    let late = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: PASTE_HEAD_PREFIX_HOLD };
+    let late = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: PASTE_HEAD_PREFIX_HOLD, shifted_head: false };
     assert!(should_zero_latency_flush_paste_pend("M", true, false, false, late));
-    let later = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19) };
+    let later = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false };
     assert!(should_zero_latency_flush_paste_pend("M", true, false, false, later));
 }
 
@@ -296,7 +296,7 @@ fn two_prefix_characters_keep_the_full_window() {
     // A second character inside the hold is the burst shape; the ordinary
     // 20 ms window then decides, however long the first has been held.
     let clip = "Microsoft Windows [Version 10.0.19045.7725]";
-    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19) };
+    let ev = PasteHeadEvidence { gesture_open: false, clip_head: Some(clip), held_for: Duration::from_millis(19), shifted_head: false };
     assert!(!should_zero_latency_flush_paste_pend("Mi", true, false, false, ev));
 }
 
@@ -304,7 +304,7 @@ fn two_prefix_characters_keep_the_full_window() {
 #[test]
 fn an_open_gesture_holds_past_the_short_hold() {
     // The Ctrl+V press is the stronger signal and is not on a timer.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::from_millis(19) };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: None, held_for: Duration::from_millis(19), shifted_head: false };
     assert!(!should_zero_latency_flush_paste_pend("M", true, false, false, ev));
 }
 
@@ -313,7 +313,7 @@ fn an_open_gesture_holds_past_the_short_hold() {
 fn paste_detection_off_never_holds_the_head() {
     // The user asked for no paste detection: nothing may add latency, whatever
     // is on the clipboard.
-    let ev = PasteHeadEvidence { gesture_open: true, clip_head: Some("Microsoft"), held_for: Duration::ZERO };
+    let ev = PasteHeadEvidence { gesture_open: true, clip_head: Some("Microsoft"), held_for: Duration::ZERO, shifted_head: false };
     assert!(should_zero_latency_flush_paste_pend("M", false, false, false, ev));
 }
 
@@ -683,55 +683,54 @@ fn pwsh_mouse_selection_option_default_off() {
 // the `send-paste` forwarding, so paste content cannot reach the shell.
 
 #[test]
-fn paste_into_command_prompt_inserts_and_advances_cursor() {
+fn paste_into_command_prompt_inserts_at_the_cursor() {
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
+    // The prompt counts its cursor in characters from the END of the line, as
+    // the shared prompt editor does, so a cursor at the end is zero and stays
+    // zero across an insert: the text went in before whatever follows it.
     let consumed = super::route_paste_to_overlay(
         "hello",
-        true, &mut command_buf, &mut command_cursor,
+        true, &mut command_buf, 0,
         false, &mut rename_buf,
         false, &mut pane_title_buf,
         false, &mut window_idx_buf,
     );
     assert!(consumed, "command_input overlay must consume paste");
     assert_eq!(command_buf, "hello");
-    assert_eq!(command_cursor, 5);
 }
 
 #[test]
 fn paste_into_command_prompt_inserts_at_cursor_position() {
     // User typed "abdef", moved cursor between b and d, then pastes "c".
+    // Three characters follow the cursor, so `command_back` is 3.
     let mut command_buf = String::from("abdef");
-    let mut command_cursor = 2;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "c",
-        true, &mut command_buf, &mut command_cursor,
+        true, &mut command_buf, 3,
         false, &mut rename_buf,
         false, &mut pane_title_buf,
         false, &mut window_idx_buf,
     );
     assert!(consumed);
     assert_eq!(command_buf, "abcdef");
-    assert_eq!(command_cursor, 3);
 }
 
 #[test]
 fn paste_with_no_overlay_active_is_not_consumed() {
     // Caller must forward via send-paste when this returns false.
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "hello",
-        false, &mut command_buf, &mut command_cursor,
+        false, &mut command_buf, 0,
         false, &mut rename_buf,
         false, &mut pane_title_buf,
         false, &mut window_idx_buf,
@@ -746,13 +745,12 @@ fn paste_with_no_overlay_active_is_not_consumed() {
 #[test]
 fn paste_into_rename_prompt_appends() {
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::from("foo");
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "bar",
-        false, &mut command_buf, &mut command_cursor,
+        false, &mut command_buf, 0,
         true, &mut rename_buf,
         false, &mut pane_title_buf,
         false, &mut window_idx_buf,
@@ -764,13 +762,12 @@ fn paste_into_rename_prompt_appends() {
 #[test]
 fn paste_into_pane_title_appends() {
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::from("title");
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "-suffix",
-        false, &mut command_buf, &mut command_cursor,
+        false, &mut command_buf, 0,
         false, &mut rename_buf,
         true, &mut pane_title_buf,
         false, &mut window_idx_buf,
@@ -788,13 +785,12 @@ fn paste_into_window_idx_prompt_keeps_the_text_as_typed() {
     // resolve too, so since the #744 follow up the prompt keeps the paste as
     // typed. Control characters are still dropped.
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "1a2b3",
-        false, &mut command_buf, &mut command_cursor,
+        false, &mut command_buf, 0,
         false, &mut rename_buf,
         false, &mut pane_title_buf,
         true, &mut window_idx_buf,
@@ -808,13 +804,12 @@ fn paste_command_prompt_takes_precedence_over_other_overlays() {
     // If multiple overlay flags are accidentally true, command_input wins
     // (matches the if/else-if order in the helper).
     let mut command_buf = String::new();
-    let mut command_cursor = 0;
     let mut rename_buf = String::new();
     let mut pane_title_buf = String::new();
     let mut window_idx_buf = String::new();
     let consumed = super::route_paste_to_overlay(
         "x",
-        true, &mut command_buf, &mut command_cursor,
+        true, &mut command_buf, 0,
         true, &mut rename_buf,
         true, &mut pane_title_buf,
         true, &mut window_idx_buf,

@@ -351,6 +351,8 @@ fn effective_when_unset(name: &str) -> Option<&'static str> {
         "copy-mode-match-style" => "bg=cyan,fg=black",
         "copy-mode-current-match-style" => "bg=magenta,fg=black",
         "copy-mode-mark-style" => "bg=red,fg=black",
+        // tmux server_client_get_key_table: unset or empty is root.
+        "key-table" => "root",
         // TERM handed to panes when default-terminal was never set.
         "default-terminal" => "xterm-256color",
         // The pane borders are the exception to the `default` rule below. tmux
@@ -493,6 +495,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
             // Check user_options first (@-prefixed), then environment
             app.user_options.get(name).cloned()
                 .or_else(|| app.environment.get(name).cloned())
+                .or_else(|| app.env_scopes.hidden_value(name))
                 .unwrap_or_default()
         }
     };

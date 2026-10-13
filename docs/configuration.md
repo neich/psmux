@@ -194,12 +194,12 @@ Details worth knowing:
 | `allow-set-title` | Bool | `off` | Allow programs to set pane title via OSC 0/2 escape sequences (see [pane-titles.md](pane-titles.md)) |
 | `allow-predictions` | Bool | `off` | Preserve PSReadLine prediction settings (see below) |
 | `default-terminal` | Str | | Terminal type string (sets `TERM` env var in panes) |
-| `update-environment` | Str | *(tmux defaults)* | Space-separated list of env vars to refresh on client attach |
+| `update-environment` | Str | *(tmux defaults)* | Space-separated glob patterns; at new-session and on every attach each matching variable of the client's environment is copied into the session environment, and a pattern nothing matches is recorded as a `-NAME` removal (tmux environ_update) |
 | `warm` | Bool | `on` | Pre-spawn shells for instant window/pane creation (see [warm-sessions.md](warm-sessions.md)) |
 | `copy-command` | Str | | Shell command for clipboard pipe |
 | `codepoint-widths` | Str | | Comma separated overrides for how many columns Unicode codepoints occupy (see [Codepoint widths](#codepoint-widths)) |
 | `terminal-overrides` | Str | | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
-| `set-clipboard` | Str | `on` | Clipboard interaction (`on`/`off`/`external`) |
+| `set-clipboard` | Str | `external` | Clipboard interaction (`on`/`off`/`external`). A copy mode yank reaches the Windows clipboard on every value, with OSC 52 to the outer terminal unless `off`. An application's own OSC 52 creates a paste buffer only on `on`, as in tmux; on `external` psmux still forwards it to the outer terminal and the Windows clipboard, where tmux ignores it; `off` ignores it |
 | `main-pane-width` | Int | `0` | Main pane width in main-vertical layout |
 | `main-pane-height` | Int | `0` | Main pane height in main-horizontal layout |
 | `session-group` | Str | | Name of the session group this session joins. `none` or an empty value clears it. See [Session Groups](#session-groups) |
@@ -898,7 +898,7 @@ Notes:
 - Only the first matching branch runs. Once one has, later `%elif` and `%else` branches are skipped.
 - `%hidden` assignments inside a skipped branch are not applied.
 - The two ways to read a `%hidden` variable are not interchangeable. `$NAME` and `${NAME}` are substituted only on ordinary config lines, so they do **not** work inside a `%if` condition. Use the format form `#{NAME}` there, which resolves through the same session environment.
-- `%hidden` writes into the session environment, so the name is also visible to `show-environment` and is inherited by new panes. It is not a private compile-time constant.
+- `%hidden` writes a hidden entry into the global environment, as tmux does: it is usable as `$NAME` and `#{NAME}`, it is listed only by `show-environment -gh`, and it is never passed to new panes.
 
 ## Accepted but Not Functional
 
@@ -1004,10 +1004,17 @@ psmux set-environment MY_VAR value
 # Unset an env var
 psmux set-environment -gu MY_VAR
 
-# Show all environment variables
+# Keep a variable OUT of new panes, even one the server inherited
+psmux set-environment -r MY_VAR
+
+# Show the session environment, the global one, or one variable
 psmux show-environment
 psmux show-environment -g
+psmux show-environment MY_VAR      # MY_VAR=value, -MY_VAR, or "unknown variable: MY_VAR" (exit 1)
+psmux show-environment -s          # shell syntax: NAME="value"; export NAME;
 ```
+
+As in tmux there are two scopes. The global environment (`-g`) is the server's start environment (the environment of the shell that started the session) plus anything set with `-g`; the session environment holds what was set without `-g`, and `new-session -e`. A new pane gets the global environment with the session one laid over it, without names removed by `-r` or marked hidden with `-h`. Because psmux runs one server per session, "global" means global to that session's server, so `set-environment -g` affects the session it is sent to rather than every session.
 
 Environment variables set this way are injected at the process level when new panes spawn, so they are completely invisible (no commands echoed in the shell).
 

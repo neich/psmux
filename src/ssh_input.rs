@@ -332,7 +332,8 @@ pub fn is_ssh_session() -> bool {
 /// The fix: use the same VT input parser as SSH sessions to properly decode
 /// X10/SGR mouse sequences from stdin.
 pub fn needs_vt_input() -> bool {
-    is_ssh_session()
+    vt_input_forced(std::env::var("PSMUX_VT_INPUT").ok().as_deref())
+        || is_ssh_session()
         || std::env::var("TERMINAL_EMULATOR")
             .map_or(false, |v| v.contains("JetBrains"))
         // WezTerm on Windows is a ConPTY-based VT terminal that writes VT mouse
@@ -343,6 +344,37 @@ pub fn needs_vt_input() -> bool {
         // env vars it always sets and route it through the VT input path.
         || std::env::var("TERM_PROGRAM").map_or(false, |v| v == "WezTerm")
         || std::env::var_os("WEZTERM_PANE").is_some()
+        // Alacritty on Windows (#787) is the same kind of host: it writes keys
+        // to the ConPTY as VT bytes and has no win32-input-mode. On the console
+        // route conhost turns its Ctrl+J (0x0a) into Ctrl+Enter, so a C-j prefix
+        // never arms (the VT parser reads 0x0a as C-j, #642), and the colour
+        // query drain gets no settle window, so the torn tail of a late reply
+        // reaches the pane as `55` and Alt+\ (#646). Alacritty sets no
+        // TERM_PROGRAM. The variable it always sets on Windows is
+        // ALACRITTY_LOG (alacritty/src/logging.rs:204, v0.17.0), since
+        // ALACRITTY_WINDOW_ID is set on Unix only.
+        || std::env::var_os("ALACRITTY_LOG").is_some()
+}
+
+/// `PSMUX_VT_INPUT=1` puts the client on the VT input route on any host
+/// (issue #766).
+///
+/// A host that writes VT text into the client's pseudoconsole (node-pty,
+/// xterm.js web front ends, anything that is not Windows Terminal's
+/// win32-input-mode) loses the paste boundaries on the console input route:
+/// conhost strips `ESC[200~` and `ESC[201~` and hands over plain key records,
+/// identical to typed ones, so a CR written right after a paste can only be
+/// told apart by timing. With VT input on, conhost passes the markers
+/// through and the VT parser forwards the paste exactly as written, the way
+/// tmux's `tty_keys_paste` does. Measured with the reporter's probe: paste
+/// at +14 ms in one piece, a CR written 50 ms later after `ESC[201~`.
+/// Windows Terminal is not a candidate: it writes win32-input-mode key
+/// reports, which only the console input route decodes.
+pub(crate) fn vt_input_forced(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
 }
 
 /// Returns the Windows build number (e.g. 19045 for Win10 22H2, 22631 for
@@ -2794,8 +2826,15 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                     match rec.event_type {
                         KEY_EVENT => {
                             let key = unsafe { &*(rec.data.as_ptr() as *const KEY_EVENT_RECORD) };
-                            // Skip key-up events entirely.
-                            if key.key_down == 0 { continue; }
+                            // Skip key-up events, except the Alt UP that
+                            // carries an Alt code character (issue #766: an
+                            // em dash written by node-pty arrives that way
+                            // even with VT input on, and was dropped here).
+                            if key.key_down == 0
+                                && !crate::console_tap::alt_code_release_char(false, key.virtual_key_code, key.u_char)
+                            {
+                                continue;
+                            }
 
                             if verbose {
                                 ssh_debug_log(&format!(
@@ -2991,6 +3030,10 @@ mod tests_windows10_ssh_mouse;
 #[cfg(test)]
 #[path = "../tests-rs/test_pr468_wezterm_vt_input.rs"]
 mod tests_pr468_wezterm_vt_input;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue787_alacritty_vt_input.rs"]
+mod tests_issue787_alacritty_vt_input;
 
 #[cfg(test)]
 #[cfg(windows)]

@@ -87,13 +87,19 @@ Write-Test "tree_chooser: KeyCode::Char('j') increments tree_selected"
 $tc_j = $src -match "KeyCode::Char\('j'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*\+\s*1\s*<\s*tree_entries\.len"
 Add-Result "tree_chooser j -> down" $tc_j ""
 
-Write-Test "tree_chooser: KeyCode::Char('h') navigates up"
-$tc_h = $src -match "KeyCode::Char\('h'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*>\s*0"
-Add-Result "tree_chooser h -> up" $tc_h ""
+# The tree's rows have depth, so tmux's mode_tree_key gives h/- the Left arm
+# (collapse, or go to the parent) and l/+ the Right arm (expand, or move down
+# once expanded), mode-tree.c `case KEYC_LEFT: case 'h': case '-':`. Since
+# discussion 776 psmux routes them through choose_tree::mode_tree_alias; the
+# behaviour itself is driven key by key in tests/test_disc776_chooser_parity.ps1.
+$treeSrc = Get-Content (Join-Path (Split-Path $srcFile) "choose_tree.rs") -Raw
+Write-Test "tree_chooser: h and - collapse like tmux's KEYC_LEFT arm"
+$tc_h = $treeSrc -match "KeyCode::Char\('h'\)\s*\|\s*KeyCode::Char\('-'\)\s+if\s+plain\s*&&\s*tree\s*=>\s*Some\(ModeKey::Collapse\)"
+Add-Result "tree_chooser h -> collapse (tmux)" $tc_h ""
 
-Write-Test "tree_chooser: KeyCode::Char('l') navigates down"
-$tc_l = $src -match "KeyCode::Char\('l'\)\s+if\s+tree_chooser\s*=>\s*\{\s*if\s+tree_selected\s*\+\s*1\s*<\s*tree_entries\.len"
-Add-Result "tree_chooser l -> down" $tc_l ""
+Write-Test "tree_chooser: l and + expand like tmux's KEYC_RIGHT arm"
+$tc_l = $treeSrc -match "KeyCode::Char\('l'\)\s*\|\s*KeyCode::Char\('\+'\)\s+if\s+plain\s*&&\s*tree\s*=>\s*Some\(ModeKey::Expand\)"
+Add-Result "tree_chooser l -> expand (tmux)" $tc_l ""
 
 Write-Test "tree_chooser: g/G map to Home/End"
 # Distinct names: $tc_g/$tc_G collide (PS vars are case-insensitive).

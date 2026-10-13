@@ -5,7 +5,8 @@
 # client, Layer 3): the choose-tree overlay is NOT captured by capture-pane and
 # is NOT reflected in dump-state, so we prove the picker is genuinely OPEN by the
 # fact that it ABSORBS typed characters (they never reach the shell). Then we
-# press `x` and assert the window count drops.
+# press `x`, which since #778 only asks (as tmux does), answer `y`, and assert
+# the window count drops.
 param([string]$Bin = "")
 
 $ErrorActionPreference = "Continue"
@@ -55,14 +56,21 @@ Start-Sleep -Seconds 1
 & $injectorExe $p.Id "MARKERabsorb{SLEEP:500}"
 Start-Sleep -Milliseconds 800
 $absorbed = -not ((Cap $S) -match "MARKERabsorb")
+# Since #778 `x` only asks, as tmux's window_tree_key does ("Kill window %u? "
+# through a PROMPT_SINGLE prompt), and the kill waits for `y`.
 & $injectorExe $p.Id "x{SLEEP:1200}"
+Start-Sleep -Milliseconds 600
+$asked = WinCount $S
+& $injectorExe $p.Id "y{SLEEP:1200}"
 Start-Sleep -Seconds 1
 $after = WinCount $S
 & $injectorExe $p.Id "{ESC}{SLEEP:300}" 2>&1 | Out-Null
 if ($absorbed) { Write-Pass "chooser is open (typed chars absorbed, not leaked to shell)" }
 else { Write-Fail "chooser did not absorb input; picker may not be open" }
-if ([int]$after -eq [int]$before - 1) { Write-Pass "x killed one window ($before -> $after)" }
-else { Write-Fail "x did not kill a window ($before -> $after)" }
+if ([int]$asked -eq [int]$before) { Write-Pass "x alone asked and killed nothing ($before -> $asked)" }
+else { Write-Fail "x alone killed without asking ($before -> $asked)" }
+if ([int]$after -eq [int]$before - 1) { Write-Pass "x then y killed one window ($before -> $after)" }
+else { Write-Fail "x then y did not kill a window ($before -> $after)" }
 KillSess $p $S
 
 # ---------------------------------------------------------------------------
@@ -95,7 +103,7 @@ Start-Sleep -Milliseconds 600
 $before = WinCount $S
 & $injectorExe $p.Id "^b{SLEEP:500}w{SLEEP:1200}"
 Start-Sleep -Seconds 1
-& $injectorExe $p.Id "j{SLEEP:350}j{SLEEP:500}x{SLEEP:1500}"
+& $injectorExe $p.Id "j{SLEEP:350}j{SLEEP:500}x{SLEEP:800}y{SLEEP:1500}"
 Start-Sleep -Seconds 1
 $after = WinCount $S
 $names = (& $PSMUX list-windows -t $S -F '#{window_name}' 2>&1) -join ","
@@ -133,7 +141,7 @@ Start-Sleep -Milliseconds 600
 $before = WinCount $S
 & $injectorExe $p.Id "^b{SLEEP:500}w{SLEEP:1200}"
 Start-Sleep -Seconds 1
-& $injectorExe $p.Id "4{SLEEP:400}x{SLEEP:1200}"
+& $injectorExe $p.Id "4{SLEEP:400}x{SLEEP:800}y{SLEEP:1200}"
 Start-Sleep -Seconds 1
 $after = WinCount $S
 $names = (& $PSMUX list-windows -t $S -F '#{window_name}' 2>&1) -join ","

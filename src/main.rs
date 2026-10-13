@@ -49,6 +49,7 @@ mod startup_trace;
 mod wsl_path;
 mod terminal_overrides;
 mod socket_path;
+mod environ;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -739,6 +740,130 @@ fn session_holding_client(ns: Option<&str>, spec: &str) -> Option<String> {
         .map(|(name, _)| name)
 }
 
+/// A CLI command list (see [`crate::cli::split_cli_command_list`]): `args`
+/// cut to its first command, and the one line the whole list goes to the
+/// server as. `None` dispatches `args` whole, as before. Control mode reads
+/// its commands from stdin and keeps its argv.
+fn split_command_list_args(args: &[String]) -> Option<(Vec<String>, CommandList)> {
+    let index = process_command_index(args)?;
+    if args[1..index].iter().any(|a| a == "-C" || a == "-CC") {
+        return None;
+    }
+    let (first, queued) = crate::cli::split_cli_command_list(&args[index..])?;
+    let mut cut = args[..index].to_vec();
+    cut.extend(first.iter().cloned());
+    let mut commands = vec![first];
+    commands.extend(queued);
+    Some((
+        cut,
+        CommandList {
+            commands,
+            globals: args[1..index].to_vec(),
+            target_session: env::var_os("PSMUX_TARGET_SESSION"),
+            target_full: env::var_os("PSMUX_TARGET_FULL"),
+        },
+    ))
+}
+
+/// A CLI command list, every command (the first included), with what running
+/// one of them as its own invocation needs: the global flags (`-L ns`, ...)
+/// and the routing variables as this process found them, before the first
+/// command's routing rewrote them.
+struct CommandList {
+    commands: Vec<Vec<String>>,
+    globals: Vec<String>,
+    target_session: Option<std::ffi::OsString>,
+    target_full: Option<std::ffi::OsString>,
+}
+
+/// Run `commands` of a list after the session `routed_base` was chosen for
+/// them: the leading run that stays on that session goes down ONE connection
+/// as one line (the server's connection loop runs them in order and stops at
+/// the first that fails), and every command from the first that leaves it
+/// ([`crate::cli::command_list_shares_session`]) runs as its own invocation
+/// of this binary, with its own routing and client side arm, as the CLI runs
+/// it alone. `first_is_routed`: `commands[0]` is the command this process
+/// already routed to `routed_base`. What the commands print goes to stdout,
+/// their errors to stderr. Returns the exit status: 0, or that of the first
+/// command that failed, after which nothing else runs (tmux cmd-queue.c).
+fn run_command_list_on(
+    list: &CommandList,
+    commands: &[Vec<String>],
+    routed_base: &str,
+    first_is_routed: bool,
+    ns: Option<&str>,
+) -> i32 {
+    let mut shared = usize::from(first_is_routed && !commands.is_empty());
+    while shared < commands.len()
+        && crate::cli::command_list_shares_session(&commands[shared], ns, routed_base)
+    {
+        shared += 1;
+    }
+    if shared > 0 {
+        let line = crate::cli::command_list_wire_line(&commands[0], &commands[1..shared]);
+        let reply = match send_control_with_response(format!("{}\n", line)) {
+            Ok(reply) => reply,
+            Err(e) => {
+                eprintln!("psmux: {}", e);
+                return 1;
+            }
+        };
+        let (out, errors) = crate::cli::command_list_reply(&reply);
+        let _ = io::stdout().write_all(out.as_bytes());
+        let _ = io::stdout().flush();
+        if !errors.is_empty() {
+            for error in errors {
+                eprintln!("psmux: {}", error);
+            }
+            return 1;
+        }
+    }
+    for command in &commands[shared..] {
+        let status = run_list_command_alone(list, command);
+        if status != 0 {
+            return status;
+        }
+    }
+    0
+}
+
+/// The commands after a `new-session` in a CLI command list, run on the
+/// session it created (or, with `-A`, found): `session_base` is its registry
+/// base. A `-t` new-session's group target is not their default target.
+/// Returns the exit status (0 when there is no list).
+fn run_new_session_list(list: Option<&CommandList>, session_base: &str, ns: Option<&str>) -> i32 {
+    let Some(list) = list else { return 0 };
+    env::set_var("PSMUX_TARGET_SESSION", session_base);
+    env::remove_var("PSMUX_TARGET_FULL");
+    run_command_list_on(list, &list.commands[1..], session_base, false, ns)
+}
+
+/// One command of a list as its own invocation of this binary: the same
+/// global flags, the routing variables this process started with, and the
+/// terminal's stdio, so it behaves exactly as `psmux <command>` would.
+fn run_list_command_alone(list: &CommandList, command: &[String]) -> i32 {
+    let exe = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
+    let mut child = std::process::Command::new(exe);
+    child.args(&list.globals).args(command);
+    for (key, value) in [
+        ("PSMUX_TARGET_SESSION", &list.target_session),
+        ("PSMUX_TARGET_FULL", &list.target_full),
+    ] {
+        match value {
+            Some(v) => { child.env(key, v); }
+            None => { child.env_remove(key); }
+        }
+    }
+    let _ = io::stdout().flush();
+    match child.status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("psmux: {}", e);
+            1
+        }
+    }
+}
+
 fn main() {
     crate::startup_trace::mark("cli.entry");
     if let Err(e) = run_main() {
@@ -1006,6 +1131,29 @@ fn run_main() -> io::Result<()> {
             crate::cli::normalize_flag_equals(env::args().collect()),
         ),
     );
+    // `psmux a \; b`: from here on `args` is the first command alone, which
+    // decides routing and the client side target check; the whole list goes
+    // to the server as one line just before dispatch (run_command_list).
+    let (args, command_list) = match split_command_list_args(&args) {
+        Some((first, list)) => (first, Some(list)),
+        None => (args, None),
+    };
+    // A list led by a command that runs alone (`ls \; ...`, `run-shell ...
+    // \; ...`) runs command by command, each its own invocation, before this
+    // process routes anything. new-session runs its own arm and then the rest
+    // on the session it made (see the new-session arm).
+    if let Some(list) = &command_list {
+        let first = list.commands[0][0].as_str();
+        if crate::cli::command_list_runs_alone(first) && !matches!(first, "new-session" | "new") {
+            for command in &list.commands {
+                let status = run_list_command_alone(list, command);
+                if status != 0 {
+                    std::process::exit(status);
+                }
+            }
+            return Ok(());
+        }
+    }
 
     // Issue #635: a value-taking flag with NO value must be rejected before
     // anything else happens, exactly as tmux's arguments.c does. This must be
@@ -1201,6 +1349,17 @@ fn run_main() -> io::Result<()> {
             // fall through to -s / $TMUX resolution.
             let is_detach_client = args.iter().any(|a| a == "detach-client" || a == "detach");
             if has_explicit_session && !is_switch_client && !is_detach_client {
+                // tmux matches a session name exactly and case-sensitively
+                // (`session_find` is a strcmp, and the prefix and fnmatch
+                // fallbacks of `cmd_find_get_session` are case-sensitive too).
+                // The registry lookup opens `<name>.port` on a case-insensitive
+                // directory, so `-t =REPRO-CASE` used to land on `repro-case`
+                // and even kill it (issue #774). A target whose stored spelling
+                // differs is not that session.
+                if crate::session::registry_case_variant(&port_file_base).is_some() {
+                    eprintln!("psmux: can't find session: {}", session);
+                    std::process::exit(1);
+                }
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
                 explicit_session_target = true;
             }
@@ -1280,6 +1439,18 @@ fn run_main() -> io::Result<()> {
         | "previous-layout" | "prevl")
     {
         cli_validate_window_pane_target(l_socket_name.as_deref());
+    }
+
+    // A command list goes to the server whole, past the first command's arm,
+    // which would rebuild the request from its own flags and drop the rest.
+    // Commands that leave the session it was routed to run on their own.
+    if let Some(list) = &command_list {
+        if !matches!(cmd, "new-session" | "new") {
+            let routed = env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string());
+            std::process::exit(run_command_list_on(
+                list, &list.commands, &routed, true, l_socket_name.as_deref(),
+            ));
+        }
     }
 
     // Handle help and version flags first
@@ -1951,11 +2122,33 @@ fn run_main() -> io::Result<()> {
                         } else { false }
                     } else { false };
                     
+                    // Issue #774: the lookup above is case-insensitive, so a
+                    // live `repro-case` answers for `REPRO-CASE`. tmux would
+                    // create a second session; psmux keys every registry file,
+                    // the single-server mutex and the warm claim on the name in
+                    // a case-insensitive namespace, so it cannot keep the two
+                    // apart. Refuse, name the session that is in the way, and
+                    // never let `-A` attach to a session with another name.
+                    let case_variant = if server_alive {
+                        crate::session::registry_case_variant(&port_file_base)
+                    } else {
+                        None
+                    };
+                    if let Some(stored) = case_variant {
+                        eprintln!(
+                            "duplicate session: {} (differs only in case from session {}, which psmux cannot keep apart on Windows)",
+                            name,
+                            crate::session::display_session_name(l_socket_name.as_deref(), &stored)
+                        );
+                        std::process::exit(1);
+                    }
                     if server_alive {
                         if attach_if_exists {
                             // -A flag: attach to existing session instead of erroring
                             env::set_var("PSMUX_SESSION_NAME", &port_file_base);
                             env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                            // The rest of a command list runs on it first.
+                            let _ = run_new_session_list(command_list.as_ref(), &port_file_base, l_socket_name.as_deref());
                             // Skip server creation, jump straight to attach
                             // (handled at the bottom of this match block)
                         } else {
@@ -2386,6 +2579,10 @@ fn run_main() -> io::Result<()> {
                     }
                 }
 
+                // `new-session -d -s x \; split-window`: the rest of the list
+                // runs on the session just made, as in tmux, after -P's line
+                // and before attaching. It used to become the new pane's shell
+                // command, which failed at once and took the session with it.
                 if detached {
                     // The readiness wait above already confirmed the initial
                     // window exists. If -P, print the pane info before returning.
@@ -2405,8 +2602,15 @@ fn run_main() -> io::Result<()> {
                             Err(_) => {}
                         }
                     }
+                    let list_status = run_new_session_list(command_list.as_ref(), &port_file_base, l_socket_name.as_deref());
+                    if list_status != 0 {
+                        std::process::exit(list_status);
+                    }
                     return Ok(());
                 } else {
+                    // The client attaches whatever the list did, as tmux's
+                    // does (it is attached before the rest of the list runs).
+                    let _ = run_new_session_list(command_list.as_ref(), &port_file_base, l_socket_name.as_deref());
                     // User wants attached session - set env vars to attach
                     env::set_var("PSMUX_SESSION_NAME", &port_file_base);
                     env::set_var("PSMUX_REMOTE_ATTACH", "1");
@@ -2797,6 +3001,11 @@ fn run_main() -> io::Result<()> {
             }
             // select-pane - Select the active pane
             "select-pane" | "selectp" => {
+                // The match below reads exact tokens, so split clusters first:
+                // `select-pane -dt %2` reached the server as a bare select-pane.
+                let cmd_args: Vec<String> = std::iter::once(cmd_args[0].clone())
+                    .chain(crate::cli::expand_flag_clusters("select-pane", &cmd_args[1..]))
+                    .collect();
                 let mut cmd = "select-pane".to_string();
                 let mut i = 1;
                 while i < cmd_args.len() {
@@ -3316,7 +3525,10 @@ fn run_main() -> io::Result<()> {
                     .and_then(|l| session_name.strip_prefix(&format!("{}__", l)))
                     .unwrap_or(&session_name)
                     .to_string();
-                if !std::path::Path::new(&port_path).exists() {
+                // `-t =REPRO-CASE` must never kill `repro-case` (issue #774).
+                if !std::path::Path::new(&port_path).exists()
+                    || crate::session::registry_case_variant(&session_name).is_some()
+                {
                     eprintln!("psmux: can't find session: {}", shown);
                     std::process::exit(1);
                 }
@@ -3390,6 +3602,15 @@ fn run_main() -> io::Result<()> {
                 if crate::session::is_warm_session(&target) {
                     std::process::exit(1);
                 }
+                // A name spelled differently from the stored session is not
+                // that session (issue #774, tmux strcmp).
+                if crate::session::registry_case_variant(&target).is_some() {
+                    eprintln!(
+                        "psmux: can't find session: {}",
+                        crate::session::display_session_name(l_socket_name.as_deref(), &target)
+                    );
+                    std::process::exit(1);
+                }
                 let path = crate::paths::port_file(&target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -3448,6 +3669,17 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 if let Some(name) = new_name {
+                    // tmux refuses a rename onto an existing session with
+                    // `duplicate session: NAME` at exit 1. psmux wrote over the
+                    // other session's registry and orphaned it, also for a name
+                    // that differs only in case (issue #774).
+                    if let Ok(current) = env::var("PSMUX_TARGET_SESSION") {
+                        let new_base = crate::session::namespaced_session_base(l_socket_name.as_deref(), &name);
+                        if crate::session::rename_blocker(&current, &new_base).is_some() {
+                            eprintln!("duplicate session: {}", name);
+                            std::process::exit(1);
+                        }
+                    }
                     send_control(format!("rename-session {}\n", crate::util::quote_arg(&name)))?;
                 }
                 return Ok(());
@@ -3830,15 +4062,24 @@ fn run_main() -> io::Result<()> {
                 // executes). Without this, `psmux run-shell "x #{pane_id}"`
                 // passed the helper that literal text, exactly as the bind path
                 // used to.
-                if shell_cmd_str.contains("#{") {
+                //
+                // Any `#` counts, not only `#{`: tmux expands `##` and `#S`
+                // too. The command goes over as ONE quoted argument. Joined
+                // raw, the server split it again and dropped its quotes, so
+                // `run-shell "Write-Output ('x' + '#{pid}')"` reached the shell
+                // as `Write-Output (x + 1234)`.
+                if shell_cmd_str.contains('#') {
                     let mut line = String::from("run-shell");
                     if background {
                         line.push_str(" -b");
                     }
                     line.push(' ');
-                    line.push_str(&shell_cmd_str);
+                    line.push_str(&crate::util::quote_arg(&shell_cmd_str));
                     line.push('\n');
-                    match crate::session::send_control_with_response(line) {
+                    // Waits for the server to finish the command (#734 follow
+                    // up): with a read bound, a body slower than 3 s came back
+                    // as "no response" and then ran AGAIN here.
+                    match crate::session::send_control_with_response_wait(line) {
                         Ok(resp) => {
                             if !resp.is_empty() {
                                 io::stdout().write_all(resp.as_bytes())?;
@@ -3926,7 +4167,34 @@ fn run_main() -> io::Result<()> {
                 // tmux errors "no last pane" at exit 1 when the window has
                 // none (cmd-select-pane.c:176); psmux exited 0 in silence
                 // (#693 item 5).
-                let resp = send_control_with_response("last-pane\n".to_string())?;
+                // -d / -e toggle the last pane's input (tmux's last-pane
+                // shares cmd_select_pane_exec with select-pane -l), so they
+                // and -t travel with the command; they used to be dropped,
+                // which made `last-pane -d` SELECT the last pane.
+                // A plain `last-pane -t` keeps acting on the current window as
+                // it always has here; only the toggle carries its -t.
+                let mut cmd = "last-pane".to_string();
+                let expanded = crate::cli::expand_flag_clusters("last-pane", &cmd_args[1..]);
+                let toggle = expanded.iter().any(|a| a == "-d" || a == "-e");
+                let mut i = 0;
+                while i < expanded.len() {
+                    match expanded[i].as_str() {
+                        "-t" => {
+                            if let Some(t) = expanded.get(i + 1) {
+                                if toggle {
+                                    cmd.push_str(&format!(" -t {}", t));
+                                }
+                                i += 1;
+                            }
+                        }
+                        "-d" => cmd.push_str(" -d"),
+                        "-e" => cmd.push_str(" -e"),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
                 if resp.trim_start().starts_with("ERROR") {
                     eprintln!("psmux: {}", resp.trim_start().trim_start_matches("ERROR:").trim());
                     std::process::exit(1);
@@ -4179,8 +4447,13 @@ fn run_main() -> io::Result<()> {
                             std::process::exit(1);
                         }
                     } else {
-                        // Send source-file command to server if attached
-                        send_control(format!("source-file {}\n", crate::util::quote_arg(&expanded)))?;
+                        // The server answers once the file has run (#734 follow
+                        // up), so this returns when its commands are done, as
+                        // tmux's client does (cmd-source-file.c waits for the
+                        // inserted commands before the item continues).
+                        let resp = crate::session::send_control_with_response_wait(
+                            format!("source-file {}\n", crate::util::quote_arg(&expanded)))?;
+                        if !resp.is_empty() { print!("{}", resp); }
                     }
                 }
                 return Ok(());
@@ -4243,7 +4516,7 @@ fn run_main() -> io::Result<()> {
             "bind-key" | "bind" => {
                 reject_unknown_key_name(&cmd_args, "bind-key");
                 reject_dangling_bound_command(&cmd_args);
-                let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+                let cmd_str = crate::util::bind_key_wire_line(&cmd_args);
                 match send_control(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
                     Err(e) if e.to_string().contains("no session") => {
@@ -4423,13 +4696,14 @@ fn run_main() -> io::Result<()> {
                 let mut cmd_true: Option<String> = None;
                 let mut cmd_false: Option<String> = None;
                 let mut format_mode = false;
+                let mut target: Option<String> = None;
                 let mut i = 1;
                 
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
                         "-b" => { background = true; }
                         "-F" => { format_mode = true; }
-                        "-t" => { i += 1; } // Skip target
+                        "-t" => { i += 1; target = cmd_args.get(i).map(|s| s.to_string()); }
                         s if !s.starts_with('-') => {
                             if condition.is_none() {
                                 condition = Some(s.to_string());
@@ -4445,6 +4719,41 @@ fn run_main() -> io::Result<()> {
                 }
                 
                 if let (Some(cond), Some(true_cmd)) = (condition, cmd_true) {
+                    // tmux format expands the shell command before it runs
+                    // (cmd-if-shell.c:86), against the target or, on an empty
+                    // server, against no session at all. Only the server can
+                    // expand, so a condition with a `#` in it goes to the
+                    // server whole and runs there, as run-shell's does. This
+                    // process used to run it verbatim: `if-shell 'guard
+                    // #{pid}'` handed the guard the literal `#{pid}` (issue
+                    // #734 follow up).
+                    if !format_mode && cond.contains('#') {
+                        let mut line = String::from("if-shell");
+                        if background { line.push_str(" -b"); }
+                        if let Some(t) = &target {
+                            line.push_str(" -t ");
+                            line.push_str(&crate::util::quote_arg(t));
+                        }
+                        for a in [Some(&cond), Some(&true_cmd), cmd_false.as_ref()].into_iter().flatten() {
+                            line.push(' ');
+                            line.push_str(&crate::util::quote_arg(a));
+                        }
+                        line.push('\n');
+                        // Waits however long the condition and the branch take
+                        // (#734 follow up). A 3 s read bound turned a slow one
+                        // into "no response", and the fallback below then ran
+                        // the condition and the branch a second time while the
+                        // server was still on the first: a duplicate session.
+                        match crate::session::send_control_with_response_wait(line) {
+                            Ok(resp) => {
+                                if !resp.is_empty() { print!("{}", resp); }
+                                return Ok(());
+                            }
+                            // No server reachable: run it here unexpanded, the
+                            // old behaviour, rather than not at all.
+                            Err(e) => eprintln!("if-shell: {} (running without format expansion)", e),
+                        }
+                    }
                     if background && !format_mode {
                         // -b flag: run the condition check in a background thread
                         // and dispatch the result command asynchronously (like tmux)
@@ -4507,7 +4816,9 @@ fn run_main() -> io::Result<()> {
                             format!("{}\n", cmd)
                         };
                         // Use send_control_with_response to capture any output from the chosen command
-                        let resp = send_control_with_response(tcp_cmd)?;
+                        // The branch may create a session (#734 follow up),
+                        // which can take longer than the 3 s read bound.
+                        let resp = crate::session::send_control_with_response_wait(tcp_cmd)?;
                         if !resp.is_empty() {
                             print!("{}", resp);
                         }
@@ -4787,52 +5098,28 @@ fn run_main() -> io::Result<()> {
                 print!("{}", resp);
                 return Ok(());
             }
-            // set-environment / setenv - Set environment variable
-            "set-environment" | "setenv" => {
-                let mut cmd = "set-environment".to_string();
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-g" => { cmd.push_str(" -g"); }
-                        "-r" => { cmd.push_str(" -r"); }
-                        "-u" => { cmd.push_str(" -u"); }
-                        "-h" => { cmd.push_str(" -h"); }
-                        "-t" => {
-                            if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
-                                i += 1;
-                            }
-                        }
-                        s => { cmd.push_str(&format!(" {}", s)); }
-                    }
-                    i += 1;
-                }
-                cmd.push('\n');
-                send_control(cmd)?;
-                return Ok(());
-            }
-            // show-environment / showenv - Show environment variables
-            "show-environment" | "showenv" => {
-                let mut cmd = "show-environment".to_string();
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-g" => { cmd.push_str(" -g"); }
-                        "-s" => { cmd.push_str(" -s"); }
-                        "-h" => { cmd.push_str(" -h"); }
-                        "-t" => {
-                            if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
-                                i += 1;
-                            }
-                        }
-                        s if !s.starts_with('-') => { cmd.push_str(&format!(" {}", s)); }
-                        _ => {}
-                    }
-                    i += 1;
+            // set-environment / setenv, show-environment / showenv (#775).
+            // Every argument is forwarded (quoted when it needs it) and the
+            // server's parser applies tmux's flags; a refusal such as
+            // `unknown variable: NAME` or `no value specified` is printed on
+            // stderr at exit 1, like tmux's cmdq_error.
+            "set-environment" | "setenv" | "show-environment" | "showenv" => {
+                let verb = if matches!(cmd_args[0].as_str(), "set-environment" | "setenv") {
+                    "set-environment"
+                } else {
+                    "show-environment"
+                };
+                let mut cmd = verb.to_string();
+                for a in &cmd_args[1..] {
+                    cmd.push(' ');
+                    cmd.push_str(&crate::util::quote_arg_if_needed(a));
                 }
                 cmd.push('\n');
                 let resp = send_control_with_response(cmd)?;
+                if let Some(err) = resp.trim_start().strip_prefix("ERROR:") {
+                    eprintln!("{}", err.trim());
+                    std::process::exit(1);
+                }
                 print!("{}", resp);
                 return Ok(());
             }

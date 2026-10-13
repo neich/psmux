@@ -22,6 +22,42 @@ thread_local! {
     static BUFFER_IDX_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static NAMED_BUFFER_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
     static CLIENT_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    // Set while expanding a format the way tmux's format_expand does (no
+    // strftime pass). See `expand_format_untimed`.
+    static NO_STRFTIME: Cell<bool> = const { Cell::new(false) };
+    // Set while a held standby answers a client (see `with_sessionless`).
+    static SESSIONLESS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with formats expanded as on a server that has no session.
+///
+/// A held standby (`start-server` + `exit-empty off`, issue #734) is the
+/// namespace's empty server, but it carries the window and pane it will hand to
+/// the next `new-session`. tmux has no session there, so a command's format has
+/// no session, window or pane to draw on (CMD_FIND_CANFAIL leaves them unset in
+/// cmd-display-message.c) and `#{session_name}` is empty. Expanding against the
+/// standby's own state printed its internal name `__warm__` and its spare
+/// window. Server scope variables (`#{pid}`, `#{host}`, options) still resolve.
+pub fn with_sessionless<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SESSIONLESS.set(self.0);
+        }
+    }
+    let _restore = Restore(SESSIONLESS.replace(on));
+    f()
+}
+
+/// Set the no session mode for the requests the server loop is about to run
+/// (see `with_sessionless`); returns the previous value.
+pub fn set_sessionless(on: bool) -> bool {
+    SESSIONLESS.replace(on)
+}
+
+/// Whether formats are being expanded for a server with no session.
+pub fn sessionless() -> bool {
+    SESSIONLESS.get()
 }
 
 /// Expand `f` with the `client_*` variables answering for client `cid`.
@@ -198,6 +234,20 @@ pub fn expand_format(fmt: &str, app: &AppState) -> String {
     expand_format_for_window(fmt, app, app.active_idx)
 }
 
+/// Expand a format WITHOUT the strftime pass, the way tmux's format_expand
+/// (format_single, format_single_from_target) does. tmux only runs strftime
+/// for format_expand_time callers (status line, display-message, pane
+/// titles); the shell command of if-shell and run-shell and a set-option -F
+/// value go through plain format_expand (cmd-if-shell.c:86,
+/// cmd-run-shell.c:144, cmd-set-option.c). A shell command is full of `%`
+/// that is not strftime: cmd's `%VAR%`, PowerShell's `%` alias, `100%`.
+pub fn expand_format_untimed(fmt: &str, app: &AppState) -> String {
+    let prev = NO_STRFTIME.replace(true);
+    let out = expand_format(fmt, app);
+    NO_STRFTIME.set(prev);
+    out
+}
+
 /// The REAL (user-visible) active window index. While a temporary -t focus
 /// is applied for command targeting, `active_idx` points at the target
 /// window; the pre-switch index saved in `temp_focus_saved_active` is what
@@ -210,6 +260,10 @@ fn real_active_idx(app: &AppState) -> usize {
 
 /// Expand tmux format strings for a specific window index.
 pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> String {
+    // No session means no window or pane either: the shorthands below that
+    // describe them are empty, as in tmux (see `no_session_var`).
+    let no_session = sessionless();
+    let shorthand_idx = if no_session { usize::MAX } else { win_idx };
     let mut result = String::with_capacity(fmt.len() * 2);
     let bytes = fmt.as_bytes();
     let len = bytes.len();
@@ -218,7 +272,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     // Whether the original format contains strftime %-sequences.
     // If so, we need to escape '%' in expanded variable content so chrono
     // only interprets the real strftime codes from the original format.
-    let has_strftime = fmt.contains('%');
+    let has_strftime = !NO_STRFTIME.get() && fmt.contains('%');
 
     while i < len {
         if bytes[i] == b'#' && i + 1 < len {
@@ -259,7 +313,9 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
             // Shorthand #X
             match bytes[i + 1] {
                 b'S' => {
-                    if has_strftime {
+                    if no_session {
+                        // empty, like #{session_name} with no session
+                    } else if has_strftime {
                         result.push_str(&escape_strftime_percent(&app.session_name));
                     } else {
                         result.push_str(&app.session_name);
@@ -267,12 +323,14 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'I' => {
-                    let n = if win_idx < app.windows.len() { app.win_display_index(win_idx) } else { 0 };
-                    result.push_str(&n.to_string());
+                    if !no_session {
+                        let n = if win_idx < app.windows.len() { app.win_display_index(win_idx) } else { 0 };
+                        result.push_str(&n.to_string());
+                    }
                     i += 2; continue;
                 }
                 b'W' => {
-                    if let Some(w) = app.windows.get(win_idx) {
+                    if let Some(w) = app.windows.get(shorthand_idx) {
                         if has_strftime {
                             result.push_str(&escape_strftime_percent(&w.name));
                         } else {
@@ -282,7 +340,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'T' => {
-                    if let Some(w) = app.windows.get(win_idx) {
+                    if let Some(w) = app.windows.get(shorthand_idx) {
                         let title = active_pane(&w.root, &w.active_path)
                             .map(|p| &p.title[..])
                             .filter(|t| !t.is_empty())
@@ -297,7 +355,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'P' => {
-                    if let Some(w) = app.windows.get(win_idx) {
+                    if let Some(w) = app.windows.get(shorthand_idx) {
                         let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
                         let pos = crate::tree::get_pane_position_in_window(&w.root, active_id).unwrap_or(0);
                         result.push_str(&(pos + app.pane_base_index).to_string());
@@ -305,7 +363,8 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'F' => {
-                    if win_idx == real_active_idx(app) { result.push('*'); }
+                    if no_session {}
+                    else if win_idx == real_active_idx(app) { result.push('*'); }
                     else if win_idx == app.last_window_idx { result.push('-'); }
                     i += 2; continue;
                 }
@@ -319,7 +378,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 }
                 b'D' => {
                     // tmux: #D = unique pane id (like %0, %1)
-                    if let Some(w) = app.windows.get(win_idx) {
+                    if let Some(w) = app.windows.get(shorthand_idx) {
                         let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
                         if has_strftime {
                             // Escape the '%' so chrono doesn't misinterpret %0, %1, etc.
@@ -539,6 +598,12 @@ pub fn expand_format_for_pane_by_id(
 ) -> String {
     if let Some((win_idx, pos)) = crate::tree::find_pane_by_id_global(app, pane_id) {
         expand_format_for_pane(fmt, app, win_idx, pos)
+    } else if let Some((win_idx, pos)) = app.windows.iter().enumerate().find_map(|(wi, w)| {
+        // A floating pane: its position follows the tiled panes (#767).
+        w.floating.iter().position(|fp| fp.id == pane_id)
+            .map(|fi| (wi, count_panes(&w.root) + fi))
+    }) {
+        expand_format_for_pane(fmt, app, win_idx, pos)
     } else {
         expand_format(fmt, app)
     }
@@ -574,6 +639,11 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
 
     // Loop expansion: #{W:format} = iterate windows, #{P:format} = iterate panes, #{S:format} = iterate sessions
     if expr.len() >= 3 && expr.as_bytes()[1] == b':' {
+        // With no session there is nothing to loop over (tmux
+        // format_loop_sessions/windows/panes walk empty lists).
+        if sessionless() && matches!(first, b'W' | b'P' | b'S') {
+            return String::new();
+        }
         match first {
             b'W' => {
                 // #{W:fmt} — expand fmt once per window, join with spaces
@@ -603,6 +673,8 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
                 if let Some(win) = app.windows.get(win_idx) {
                     let mut pane_ids = Vec::new();
                     collect_pane_ids(&win.root, &mut pane_ids);
+                    // tmux format_loop_panes walks w->panes, floats included (#767).
+                    pane_ids.extend(win.floating.iter().map(|fp| fp.id));
                     for (pos, _pid) in pane_ids.iter().enumerate() {
                         PANE_POS_OVERRIDE.set(Some(pos));
                         parts.push(expand_format_for_window(inner_fmt, app, win_idx));
@@ -1260,6 +1332,7 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
             // (format strings use #{cpu_percentage} without the @ prefix).
             app.user_options.get(name).cloned()
                 .or_else(|| app.environment.get(name).cloned())
+                .or_else(|| app.env_scopes.hidden_value(name))
                 .or_else(|| {
                     if !name.starts_with('@') {
                         app.user_options.get(&format!("@{}", name)).cloned()
@@ -1423,7 +1496,7 @@ fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
             let h = format_client(app).map(|ci| ci.height).unwrap_or(app.client_area.height);
             (h + if app.status_visible { 1 } else { 0 }).to_string()
         }
-        "client_session" => app.session_name.clone(),
+        "client_session" => if sessionless() { String::new() } else { app.session_name.clone() },
         // The session this client came from, empty when it has not switched.
         // This was aliased to client_session, so it echoed the CURRENT session
         // and could neither predict what `-l` would do nor verify what it did
@@ -1469,7 +1542,9 @@ fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
         } else {
             match app.mode {
                 Mode::CopyMode => "copy-mode-vi".into(),
-                _ => "root".into(),
+                // The session's `key-table` (tmux reports c->keytable, which
+                // server_client_set_key_table(c, NULL) points at it).
+                _ => crate::server::helpers::default_key_table(app).to_string(),
             }
         },
         "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
@@ -1490,7 +1565,35 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
     if v == UNKNOWN_VAR { String::new() } else { v }
 }
 
+/// Whether `var` describes a session, window or pane, so that a server with
+/// no session (a held standby, see `with_sessionless`) leaves it empty, the
+/// way tmux's format_defaults adds no such keys without a session. Server
+/// scope variables (`pid`, `host`, `socket_path`, `start_time`, `version`,
+/// buffers, options) are not, and keep resolving.
+fn no_session_var(var: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "session_", "window_", "pane_", "alternate_", "copy_cursor_", "cursor_",
+        "keypad_", "scroll_", "search_", "selection_",
+    ];
+    const NAMES: &[&str] = &[
+        "history_bytes", "history_size", "insert_flag", "line", "origin_flag", "wrap_flag",
+        "mouse_all_flag", "mouse_any_flag", "mouse_button_flag", "mouse_standard_flag",
+        "mouse_utf8_flag", "mouse_line", "mouse_word", "mouse_x", "mouse_y",
+    ];
+    PREFIXES.iter().any(|p| var.starts_with(p)) || NAMES.contains(&var)
+}
+
 fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
+    // With no session at all nothing session scoped resolves, and tmux's
+    // server_sessions counts 0.
+    if sessionless() {
+        if var == "server_sessions" {
+            return "0".to_string();
+        }
+        if no_session_var(var) {
+            return String::new();
+        }
+    }
     let win = match app.windows.get(win_idx) {
         Some(w) => w,
         None => {
@@ -1522,23 +1625,71 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
     };
     // Resolve the target pane for format expansion. When PANE_POS_OVERRIDE is set
     // (during list-panes iteration), use that positional pane instead of the active pane.
+    //
+    // Floating panes (tmux new-pane) come AFTER the tiled panes in position
+    // order, as in tmux, where window_add_pane puts a SPAWN_FLOATING pane at
+    // the tail of w->panes, so list-panes and #{pane_index} count them (#767).
+    // A focused float is the window's active pane (tmux makes it w->active),
+    // so the tiled pane behind it is not active while the float has focus.
+    let tiled_count = count_panes(&win.root);
+    let focused_float = win.floating_focus.filter(|fi| *fi < win.floating.len());
     let (fmt_pane_pos, fmt_pane_is_active) = {
         let override_pos = PANE_POS_OVERRIDE.get();
         if let Some(pos) = override_pos {
-            let active_id = get_active_pane_id(&win.root, &win.active_path);
-            let is_active = crate::tree::get_nth_pane(&win.root, pos)
-                .map(|p| Some(p.id) == active_id).unwrap_or(false);
+            let is_active = if pos >= tiled_count {
+                focused_float == Some(pos - tiled_count)
+            } else {
+                let active_id = get_active_pane_id(&win.root, &win.active_path);
+                focused_float.is_none()
+                    && crate::tree::get_nth_pane(&win.root, pos)
+                        .map(|p| Some(p.id) == active_id).unwrap_or(false)
+            };
             (pos, is_active)
+        } else if let Some(fi) = focused_float {
+            (tiled_count + fi, true)
         } else {
             let active_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
             let pos = crate::tree::get_pane_position_in_window(&win.root, active_id).unwrap_or(0);
             (pos, true)
         }
     };
+    // The floating pane the position names, if it names one.
+    let target_float = fmt_pane_pos
+        .checked_sub(tiled_count)
+        .and_then(|fi| win.floating.get(fi));
     // Helper closure to get the target pane reference
     let target_pane = || -> Option<&Pane> {
-        crate::tree::get_nth_pane(&win.root, fmt_pane_pos)
+        match target_float {
+            Some(fp) => Some(&fp.pane),
+            None => crate::tree::get_nth_pane(&win.root, fmt_pane_pos),
+        }
     };
+    // A floating pane's content rect (x, y, w, h) inside the window. The PTY
+    // is the float's outer size minus its border, and the border is drawn
+    // around it, so the content starts one cell in. `border none` is drawn
+    // with no inset by the client, so it starts at the float's corner.
+    let float_rect = |fp: &crate::types::FloatingPane| -> (u16, u16, u16, u16) {
+        let (ox, oy) = if fp.border == "none" { (fp.x, fp.y) } else { (fp.x + 1, fp.y + 1) };
+        (win.area.x + ox, win.area.y + oy, fp.pane.last_cols, fp.pane.last_rows)
+    };
+    // A float is not in the tiled layout, so its geometry comes from its own
+    // rect rather than from compute_rects (which would never find it).
+    if let Some(fp) = target_float {
+        let (x, y, w, h) = float_rect(fp);
+        let flag = |b: bool| -> String { if b { "1".into() } else { "0".into() } };
+        let geo = match var {
+            "pane_left" => Some(x.to_string()),
+            "pane_top" => Some(y.to_string()),
+            "pane_right" => Some((x + w).saturating_sub(1).to_string()),
+            "pane_bottom" => Some((y + h).saturating_sub(1).to_string()),
+            "pane_at_left" => Some(flag(x == win.area.x)),
+            "pane_at_top" => Some(flag(y == win.area.y)),
+            "pane_at_right" => Some(flag(x + w >= win.area.x + win.area.width)),
+            "pane_at_bottom" => Some(flag(y + h >= win.area.y + win.area.height)),
+            _ => None,
+        };
+        if let Some(v) = geo { return v; }
+    }
     match var {
         // ── Session ──
         "session_name" => app.session_name.clone(),
@@ -1567,7 +1718,9 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_index" => app.win_display_index(win_idx).to_string(),
         "window_name" => win.name.clone(),
         "window_active" => if win_idx == real_active_idx(app) { "1".into() } else { "0".into() },
-        "window_panes" => count_panes(&win.root).to_string(),
+        // tmux counts floating panes too: format_cb_window_panes is
+        // window_count_panes(w, 1), with_floating set (#767).
+        "window_panes" => (tiled_count + win.floating.len()).to_string(),
         "window_flags" | "window_raw_flags" => {
             let mut f = String::new();
             if win_idx == real_active_idx(app) { f.push('*'); }
@@ -1652,6 +1805,35 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             }
         }
         "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
+        // tmux format.c format_cb_pane_floating_flag: 1 for a floating pane,
+        // 0 for a tiled one (#767).
+        "pane_floating_flag" => if target_float.is_some() { "1".into() } else { "0".into() },
+        // tmux format_cb_pane_x / _y: the pane's content offset in the window.
+        "pane_x" | "pane_y" => {
+            let want_x = var == "pane_x";
+            if let Some(fp) = target_float {
+                let (x, y, _, _) = float_rect(fp);
+                return if want_x { x.to_string() } else { y.to_string() };
+            }
+            if let Some(p) = target_pane() {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) {
+                    return if want_x { rect.x.to_string() } else { rect.y.to_string() };
+                }
+            }
+            "0".into()
+        }
+        // tmux format_cb_pane_z (window_pane_zindex): floats are numbered
+        // from the topmost (0) down; a tiled pane sits under every float,
+        // at the float count plus one. psmux draws `floating` in order, so
+        // the LAST entry is on top.
+        "pane_z" => match fmt_pane_pos.checked_sub(tiled_count) {
+            Some(fi) if fi < win.floating.len() => (win.floating.len() - 1 - fi).to_string(),
+            _ => (win.floating.len() + 1).to_string(),
+        },
         "pane_current_command" => {
             if let Some(p) = target_pane() {
                 // Shell-integration OSC is authoritative (issue #299):
@@ -1864,8 +2046,12 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         }
         "pane_dead_signal" | "pane_dead_status" | "pane_dead_time" => "0".into(),
         "pane_format" => "1".into(),
-        "pane_input_off"
-        | "pane_pipe" | "pane_unseen_changes" => "0".into(),
+        // select-pane -d / -e (tmux format.c format_cb_pane_input_off:
+        // `wp->flags & PANE_INPUTOFF`).
+        "pane_input_off" => {
+            if target_pane().is_some_and(|p| p.input_off) { "1".into() } else { "0".into() }
+        }
+        "pane_pipe" | "pane_unseen_changes" => "0".into(),
         "pane_last" => {
             if let Some(p) = target_pane() {
                 if !app.last_pane_path.is_empty() {
@@ -2527,6 +2713,9 @@ pub fn format_list_panes(app: &AppState, fmt: &str, win_idx: usize) -> String {
     };
     let mut ids = Vec::new();
     collect_pane_ids(&win.root, &mut ids);
+    // Floating panes follow the tiled ones, as tmux lists them (#767): they
+    // were missing, so a script walking list-panes could never find one.
+    ids.extend(win.floating.iter().map(|fp| fp.id));
     ids.iter().enumerate().map(|(pos, _pid)| {
         PANE_POS_OVERRIDE.set(Some(pos));
         let line = expand_format_for_window(fmt, app, win_idx);
@@ -2575,3 +2764,11 @@ mod tests_format_modifier_chain_parity;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue724_client_formats.rs"]
 mod tests_issue724_client_formats;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue767_floating_panes.rs"]
+mod tests_issue767_floating_panes;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_side_sessionless.rs"]
+mod tests_issue734_side_sessionless;

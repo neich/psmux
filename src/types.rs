@@ -264,6 +264,30 @@ pub struct Pane {
     /// window is unaffected, and `respawn_active_pane` clears it with the rest
     /// of the per-ConPTY caches.
     pub win32_input_latched: bool,
+    /// `select-pane -d` / `-e`: tmux's per-pane `PANE_INPUTOFF` flag
+    /// (cmd-select-pane.c sets and clears it, tmux.h `PANE_INPUTOFF`).
+    ///
+    /// While it is set, nothing typed or sent as INPUT reaches the pane's
+    /// program: tmux's `window_pane_key` (window.c) returns before
+    /// `input_key_pane` for such a pane, so keys from an attached client,
+    /// every `send-keys` form, `send-prefix` and forwarded mouse events are
+    /// dropped, `window_pane_copy_key` leaves the pane out of a
+    /// `synchronize-panes` fan out, and `paste-buffer` writes nothing
+    /// (cmd-paste-buffer.c checks the flag before `bufferevent_write`).
+    ///
+    /// Two things deliberately still get through, because tmux does not route
+    /// them through `window_pane_key`'s program half: keys a pane MODE consumes
+    /// (copy mode and its prompts, `send-keys -X`), and the server's own replies
+    /// to the program's terminal queries (CPR, DA, OSC 4/10/11 colours, focus
+    /// reports).  The replies share `writer` with input, which is why the gate
+    /// lives at the input entry points (`input::input_target_accepts_input`
+    /// and its callers) and never in the writer.
+    ///
+    /// Like tmux's `wp->flags`, it belongs to the pane, not to its process:
+    /// `respawn-pane` keeps it (spawn.c only clears PANE_STATUSREADY and
+    /// PANE_STATUSDRAWN on a respawn), and swap/break/join-pane move it with
+    /// the pane.  Exposed read-only as `#{pane_input_off}`.
+    pub input_off: bool,
     /// Cached foreground-process classification for the scroll-wheel
     /// alternate-scroll decision (issue #277): `(timestamp, is_shell,
     /// foreground_exe_name)`. `is_shell` mirrors
@@ -388,6 +412,13 @@ pub struct Pane {
 }
 
 impl Pane {
+    /// May input reach this pane's program?  False after `select-pane -d`
+    /// (see [`Pane::input_off`]); every key, paste and mouse forward to the
+    /// program checks this.
+    pub fn accepts_input(&self) -> bool {
+        !self.input_off
+    }
+
     /// Display this pane through a copy-mode snapshot: `term` becomes a frozen
     /// copy of the current screen and the live parser is parked in
     /// `live_term`.  The PTY reader keeps feeding the live parser, so the
@@ -1720,6 +1751,9 @@ pub struct AppState {
     pub update_environment: Vec<String>,
     /// Environment variables set via set-environment
     pub environment: std::collections::HashMap<String, String>,
+    /// Removal markers, hidden entries and shadowed global values that
+    /// `environment` cannot express (tmux global vs session scopes, #775).
+    pub env_scopes: crate::environ::EnvScopes,
     /// User/plugin options (@-prefixed, tmux convention).
     /// Stored separately from `environment` so they are NOT passed as
     /// shell environment variables to child panes (#105).
@@ -1827,7 +1861,7 @@ pub struct AppState {
     /// `file:line: message` (file comes from config::current_config_file()).
     /// None when parsing a single runtime command.
     pub config_warn_line: Option<usize>,
-    /// set-clipboard: "on", "off", "external" (default "on")
+    /// set-clipboard: "on", "off", "external" (default "external", as tmux)
     pub set_clipboard: String,
     /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
     pub clipboard_osc52: Option<String>,
@@ -2014,6 +2048,14 @@ impl AppState {
     /// client-attached/session-created hooks, and the like.
     pub fn is_warm_server(&self) -> bool {
         self.session_name == "__warm__"
+    }
+
+    /// Whether this is a HELD standby (issue #734): unclaimed with
+    /// `exit-empty` off, so untargeted commands reach it as the namespace's
+    /// empty server. Its window and pane are the next session's, not a
+    /// session the user has, so commands it answers see no session.
+    pub fn is_held_standby(&self) -> bool {
+        self.is_warm_server() && !self.exit_empty
     }
 
     /// Whether this server should run the periodic `status-interval` timer,
@@ -2786,6 +2828,7 @@ impl AppState {
                 "XAUTHORITY".to_string(),
             ],
             environment: std::collections::HashMap::new(),
+            env_scopes: crate::environ::EnvScopes::default(),
             user_options: std::collections::HashMap::new(),
             user_set_options: std::collections::HashSet::new(),
             pane_border_style: String::new(),
@@ -2830,7 +2873,7 @@ impl AppState {
             terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
             config_warn_line: None,
-            set_clipboard: "on".to_string(),
+            set_clipboard: "external".to_string(),
             clipboard_osc52: None,
             bell_forward: false,
             env_shim: true,
@@ -2924,8 +2967,10 @@ pub enum Action {
     SwitchTable(String),
 }
 
+/// A key binding. `note` is `bind-key -N`'s text (tmux key_binding.note),
+/// what `list-keys -N` shows in place of the command.
 #[derive(Clone)]
-pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
+pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool, pub note: Option<String> }
 
 /// Tiled layout, border settings, and focus state used by chooser previews.
 /// Persistent floating panes and pane title bars are not included.
@@ -3326,6 +3371,27 @@ pub enum CtrlReq {
     LastPane {
         resp: mpsc::Sender<Result<(), String>>,
     },
+    /// `select-pane -d` (`off` true) / `select-pane -e` (`off` false): set or
+    /// clear [`Pane::input_off`] on the pane `target` names (None: the active
+    /// pane), and with `last` on that window's last pane instead
+    /// (`select-pane -l -d/-e`).  See `server::set_pane_input_off`.
+    ///
+    /// The target travels INSIDE the request rather than as a
+    /// `CtrlReq::Targeted` wrapper on purpose: the temporary focus a wrapper
+    /// applies moves the target WINDOW's active pane and only the real active
+    /// window's is put back, so `select-pane -d -t %N` for a pane in another
+    /// window would have changed which pane that window shows as active.
+    /// tmux's cmd-select-pane.c flips `PANE_INPUTOFF`, redraws borders and
+    /// status, and returns: the active pane, zoom, last pane and MRU stay as
+    /// they were, and the `after-select-pane` hook (cmd-select-pane.c:276) is
+    /// never reached.  `resp` carries tmux's error (`no last pane`, or a
+    /// target that vanished after validation) to a one-shot caller.
+    SetPaneInputOff {
+        target: Option<TempTarget>,
+        off: bool,
+        last: bool,
+        resp: Option<mpsc::Sender<Result<(), String>>>,
+    },
     /// `rotate-window`. The flag is tmux's `-U` (its default): true moves the
     /// first pane to the last cell, false is `-D`.
     RotateWindow(bool),
@@ -3394,11 +3460,13 @@ pub enum CtrlReq {
     },
     /// show-options -p (issue #580): list a pane's scoped options.
     ShowPaneOptions(String, mpsc::Sender<String>),
-    BindKey(String, String, String, bool),  // table, key, command, repeat
+    BindKey(String, String, String, bool, Option<String>),  // table, key, command, repeat, -N note
     UnbindKey(String, Option<String>),  // key, optional table (None = prefix)
     UnbindAll,
     UnbindAllInTable(String),
     ListKeys(mpsc::Sender<String>),
+    /// list-keys -N: (reply, -T table, -a, key filter).
+    ListKeyNotes(mpsc::Sender<String>, Option<String>, bool, Option<String>),
     SetOption(String, String),
     SetOptionQuiet(String, String, bool),  // set-option with quiet flag
     SetOptionUnset(String),  // set-option -u
@@ -3446,7 +3514,9 @@ pub enum CtrlReq {
     /// so `-g` was dropped on the floor and a plain `-w` printed every name
     /// including the ones the window does not own (#648, #655).
     ShowWindowOptionsFor(mpsc::Sender<String>, String, crate::server::options::WindowListing),
-    SourceFile(String),
+    /// `(path, done)`: `done` is dropped once the file has run, which is how a
+    /// one-shot `source-file` knows when to answer (#734 follow up).
+    SourceFile(String, Option<mpsc::Sender<()>>),
     /// Expand `#{...}` format variables against the live server state and send
     /// the result back: `(format_string, reply)`.
     ///
@@ -3653,9 +3723,13 @@ pub enum CtrlReq {
     DebugStall(u64),
     SaveBuffer(String),
     LoadBuffer(String),
-    SetEnvironment(String, String),
-    UnsetEnvironment(String),
-    ShowEnvironment(mpsc::Sender<String>),
+    /// A parsed and validated `set-environment` (value already `-F` expanded).
+    SetEnvironment(crate::environ::SetEnvArgs),
+    /// The attaching client's environment (`client-environ`), consumed by the
+    /// ClientAttach that follows it for update-environment (#775).
+    ClientEnviron(Vec<(String, String)>),
+    /// A parsed `show-environment`: the listing, or tmux's error text.
+    ShowEnvironment(crate::environ::ShowEnvArgs, mpsc::Sender<Result<String, String>>),
     SetHook(String, String),
     AppendHook(String, String),
     ShowHooks(mpsc::Sender<String>),

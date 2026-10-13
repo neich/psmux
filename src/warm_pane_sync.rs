@@ -196,9 +196,21 @@ pub fn for_post_config(app: &AppState) -> WarmPaneSync {
     // Config injected env vars (e.g. via set -g default-terminal,
     // set-environment in the config, or update-environment passing
     // through client env): the early child has them missing.
+    // Names the update-environment seed wrote (#775) carry the start
+    // environment's values, which the early child inherited already; a seeded
+    // removal is a name the start environment never had.  Config removals and
+    // hidden entries, though, are names the early child still has.
+    let seeded = &app.env_scopes.seeded;
     let needs_env = app.environment.iter().any(|(k, _)| {
         !k.starts_with("PSMUX_TARGET_SESSION") && k != "TMUX" && k != "TMUX_PANE"
-    });
+            && !seeded.contains(k)
+    }) || app.env_scopes.session_removed.iter().chain(app.env_scopes.session_hidden.keys())
+        .any(|k| !seeded.contains(k))
+        || !app.env_scopes.global_removed.is_empty()
+        // A config `set-environment -g` (#775 keeps global values in the
+        // process environment, not in `app.environment`): the early pane was
+        // born before the config ran, so it lacks the value.
+        || !app.env_scopes.global_set.is_empty();
     if needs_env {
         return WarmPaneSync::Respawn("post-config: env vars set");
     }
@@ -437,9 +449,13 @@ pub mod inflight {
     /// The spawner has a pid. Returns false when the server is tearing down, in
     /// which case the caller owns the kill: the entry is dropped here so the
     /// reaper does not also chase a pid the spawner is already killing.
+    ///
+    /// On the teardown answer the entry is deliberately LEFT in place: the
+    /// caller kills its child and then calls [`release`]. Removing it here
+    /// let a reaper that was still polling see an empty registry, return,
+    /// and `process::exit` before the spawner's kill had run.
     pub fn record_pid(pane_id: usize, pid: Option<u32>) -> bool {
         if is_tearing_down() {
-            with(|m| m.remove(&pane_id));
             return false;
         }
         with(|m| {
@@ -517,16 +533,34 @@ pub mod inflight {
 /// kill goes through the platform kill guard, which validates each pid's
 /// creation time before terminating, so a pid recycled between the spawn and
 /// this call is never touched.
+/// How long a teardown waits for spare spawns caught inside CreateProcessW.
+///
+/// Such a spawn cannot be killed until CreateProcessW returns its pid, and for
+/// the Store pwsh (which refuses the job list, see portable-pty spawn_command)
+/// the shell it creates is SUSPENDED AND OUTSIDE ITS JOB until the spawner
+/// assigns it. A `process::exit` in that window ends the spawner thread right
+/// there, so the shell is never assigned, never resumed and never killed: an
+/// orphan of a dead server, for ever. The budget therefore has to outlast a
+/// slow CreateProcessW, not a typical one. It was 400 ms (twice, about 900 ms
+/// in all), and a sweep whose median CreateProcessW was 736 ms left 3 orphan
+/// pwsh in one round. `PSMUX_TEST_SLOW_CREATE_MS` reproduces that window.
+///
+/// The wait only happens while a spawn is in flight without a pid; an idle
+/// shutdown returns at once, and each spawn ends the wait the moment it either
+/// registers its pid or kills its own child.
+pub const INFLIGHT_REAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4000);
+
+/// How long a one-shot `kill-server` connection is held open before it is
+/// answered anyway. The caller force-kills the server 50 ms after this socket
+/// closes, so it must outlast the whole shutdown, reaper wait included, or the
+/// force-kill lands in the window the reaper is waiting out.
+pub const KILL_SERVER_HOLD: std::time::Duration = std::time::Duration::from_millis(5000);
+
 pub fn reap_inflight_spares() -> usize {
-    // The budget only applies while a spawn is actually in flight without a pid
-    // yet, ie a thread inside CreateProcessW; an idle shutdown returns from here
-    // immediately. 400ms is what a CreateProcessW costs on a machine under load
-    // (a 150ms budget let two shells through during a concurrent test sweep),
-    // and the shutdown path calls this twice with its client courtesies in
-    // between, so the real grace is about twice this. Both fit inside the
-    // 1500ms the kill-server handler holds its socket open for, which is what
-    // keeps the caller's force-kill fallback from cutting the shutdown short.
-    let pids = inflight::reap(std::time::Duration::from_millis(400), std::thread::sleep);
+    // The shutdown path calls this twice with its client courtesies in between;
+    // the first call does any waiting, the second sweeps a pid that registered
+    // on the way out.
+    let pids = inflight::reap(INFLIGHT_REAP_BUDGET, std::thread::sleep);
     for pid in &pids {
         crate::platform::process_kill::kill_pid_tree(*pid);
     }

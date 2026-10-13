@@ -83,6 +83,13 @@ function Kill-OurServer([int]$serverPid) {
 }
 
 function Cleanup-Namespace() {
+    # Ask the namespace's servers to exit over their own channel first. The ssh
+    # leg's server runs under the ssh logon's token, which is elevated for an
+    # admin account, so an unelevated suite's Stop-Process is refused and the
+    # server (with its pane shells and warm pool) outlived the suite by hours,
+    # loading every suite after it (sweeps 2026-10-08, ~100 refused kills each).
+    # kill-server is scoped to this unique namespace (#649).
+    & $PSMUX -L $NS kill-server 2>&1 | Out-Null
     foreach ($f in Get-ChildItem -Path $psmuxDir -Filter "$NS*.pid" -EA SilentlyContinue) {
         $raw = (Get-Content $f.FullName -Raw -EA SilentlyContinue)
         if ($raw) { Kill-OurServer ([int](($raw.Trim() -split ':')[0])) }

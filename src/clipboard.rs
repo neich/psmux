@@ -104,8 +104,21 @@ pub fn copy_to_system_clipboard(_text: &str) {}
 /// within the allocation). The scan is bounded by the actual `HGLOBAL`
 /// size via `GlobalSize` so a malformed payload cannot trigger an
 /// out-of-bounds read.
-#[cfg(windows)]
 pub fn read_from_system_clipboard() -> Option<String> {
+    try_read_from_system_clipboard().ok().flatten()
+}
+
+/// Another window held the clipboard open through every retry, so nothing is
+/// known about its contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardBusy;
+
+/// [`read_from_system_clipboard`], telling a clipboard that could not be
+/// opened (`Err`) apart from one that holds no text (`Ok(None)`).  A caller
+/// that caches the answer must not cache the first: it is a moment in another
+/// process, not a property of the clipboard (issue #684).
+#[cfg(windows)]
+pub fn try_read_from_system_clipboard() -> Result<Option<String>, ClipboardBusy> {
     const CF_UNICODETEXT: u32 = 13;
     for _ in 0..5 {
         let opened = unsafe { OpenClipboard(std::ptr::null_mut()) };
@@ -148,13 +161,13 @@ pub fn read_from_system_clipboard() -> Option<String> {
             let _ = CloseClipboard();
             text
         };
-        return result;
+        return Ok(result);
     }
-    None
+    Err(ClipboardBusy)
 }
 
 #[cfg(not(windows))]
-pub fn read_from_system_clipboard() -> Option<String> { None }
+pub fn try_read_from_system_clipboard() -> Result<Option<String>, ClipboardBusy> { Ok(None) }
 
 /// The system clipboard's change counter.
 ///

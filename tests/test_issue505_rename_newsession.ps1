@@ -19,7 +19,10 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
-$psmuxDir = "$env:USERPROFILE\.psmux"
+# Honour PSMUX_DATA_DIR: Reset-All deletes every registry file in this
+# directory, so with an isolated data dir it must never touch the real one
+# (2026-10-13 a run with a private PSMUX_DATA_DIR wiped ~/.psmux).
+$psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 

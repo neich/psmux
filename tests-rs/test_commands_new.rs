@@ -170,16 +170,19 @@ fn list_keys_shows_bound_keys_with_table_key_command() {
             key: (KeyCode::Char('c'), KeyModifiers::NONE),
             action: Action::NewWindow,
             repeat: false,
+            note: None,
         },
         crate::types::Bind {
             key: (KeyCode::Char('x'), KeyModifiers::CONTROL),
             action: Action::KillPane,
             repeat: false,
+            note: None,
         },
         crate::types::Bind {
             key: (KeyCode::Up, KeyModifiers::NONE),
             action: Action::MoveFocus(FocusDir::Up),
             repeat: false,
+            note: None,
         },
     ];
     app.key_tables.insert("prefix".to_string(), binds);
@@ -201,10 +204,10 @@ fn list_keys_shows_bound_keys_with_table_key_command() {
 fn list_keys_shows_multiple_tables() {
     let mut app = mock_app_with_window();
     app.key_tables.insert("prefix".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::Char('n'), KeyModifiers::NONE), action: Action::NextWindow, repeat: false },
+        crate::types::Bind { key: (KeyCode::Char('n'), KeyModifiers::NONE), action: Action::NextWindow, repeat: false, note: None },
     ]);
     app.key_tables.insert("copy-mode".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::Char('q'), KeyModifiers::NONE), action: Action::Command("cancel".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::Char('q'), KeyModifiers::NONE), action: Action::Command("cancel".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app, "list-keys").unwrap();
     let (_, out) = extract_popup(&app);
@@ -218,14 +221,14 @@ fn list_keys_shows_multiple_tables() {
 fn lsk_alias_produces_same_output() {
     let mut app1 = mock_app_with_window();
     app1.key_tables.insert("root".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app1, "list-keys").unwrap();
     let out1 = extract_popup(&app1).1.to_string();
 
     let mut app2 = mock_app_with_window();
     app2.key_tables.insert("root".to_string(), vec![
-        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false },
+        crate::types::Bind { key: (KeyCode::F(1), KeyModifiers::NONE), action: Action::Command("help".to_string()), repeat: false, note: None },
     ]);
     execute_command_string(&mut app2, "lsk").unwrap();
     let out2 = extract_popup(&app2).1.to_string();
@@ -311,19 +314,22 @@ fn list_clients_output_has_session_and_window_info() {
     let mut app = mock_app_with_windows(&["editor", "term"]);
     app.active_idx = 1;
     app.session_name = "my_project".to_string();
+    app.register_client(1, false);
     execute_command_string(&mut app, "list-clients").unwrap();
     let (cmd, out) = extract_popup(&app);
     assert_eq!(cmd, "list-clients");
+    // tmux's LIST_CLIENTS_TEMPLATE: client name, session, size, terminal and
+    // flags. It has no window name and no "(utf8)"; those came from the made
+    // up row this used to print (discussion #776).
     assert!(out.contains("my_project"), "must contain session name");
-    assert!(out.contains("term"), "must contain active window name");
-    assert!(out.contains("(utf8)"), "must contain encoding marker");
-    assert!(out.contains("/dev/pts/"), "must contain pseudo-terminal path");
+    assert!(out.contains("/dev/pts/1:"), "must name the registered client");
 }
 
 #[test]
 fn lsc_alias_matches_list_clients() {
     let mut app = mock_app_with_window();
     app.session_name = "s1".to_string();
+    app.register_client(1, false);
     execute_command_string(&mut app, "lsc").unwrap();
     let (_, out) = extract_popup(&app);
     assert!(out.contains("s1"), "lsc should show session name");
@@ -626,6 +632,7 @@ fn rename_session_changes_session_name() {
     execute_command_string(&mut app, "rename-session production").unwrap();
     assert_eq!(app.session_name, "production");
     // Verify list-clients reflects the new name
+    app.register_client(1, false);
     execute_command_string(&mut app, "list-clients").unwrap();
     let (_, out) = extract_popup(&app);
     assert!(out.contains("production"), "list-clients should use new session name");
@@ -967,10 +974,10 @@ fn has_session_is_noop() {
 }
 
 #[test]
-fn choose_client_is_noop() {
+fn choose_client_opens_the_client_list() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "choose-client").unwrap();
-    assert!(matches!(app.mode, Mode::Passthrough));
+    assert!(matches!(&app.mode, Mode::PopupMode { command, .. } if command == "choose-client"));
 }
 
 #[test]
@@ -1468,11 +1475,12 @@ fn workflow_complex_command_sequence_via_prompt() {
     // Rename session via prompt
     run_via_prompt(&mut app, "rename-session my_project");
     assert_eq!(app.session_name, "my_project");
-    // Verify list-clients shows updated session and window
+    // Verify list-clients shows the updated session (tmux's client row has
+    // no window name, so the renamed window is checked above instead)
+    app.register_client(1, false);
     run_via_prompt(&mut app, "list-clients");
     let (_, out) = extract_popup(&app);
     assert!(out.contains("my_project"), "should show renamed session");
-    assert!(out.contains("renamed_aux"), "should show current (renamed) window");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1667,6 +1675,14 @@ fn window_index_prompt_accepts_digits_only() {
 //  Issue #170: run-shell output display
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Ceiling for a run-shell result to arrive. recv_timeout returns the moment it
+/// does, so this only bounds a starved spawn: unit tests share one process, on
+/// Windows process creation in a process is serialized, and with some twenty
+/// tests in `cargo test -- shell` starting Store PowerShell at once a single
+/// spawn() was measured blocked for 5.8 s. 10 s timed out in that run; the
+/// assertions are about the output text, not how fast it came.
+const RUN_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[test]
 fn run_shell_captures_and_displays_output() {
     let mut app = mock_app();
@@ -1681,7 +1697,7 @@ fn run_shell_captures_and_displays_output() {
     // run-shell is now async: the command runs in a background thread
     // and sends output via run_shell_rx. We need to recv the result.
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run-shell output within 10s");
     assert_eq!(title, "run-shell");
     assert!(
@@ -1721,7 +1737,7 @@ fn run_shell_alias_captures_output() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (_title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run alias output within 10s");
     assert!(
         text.contains("alias-test"),
@@ -1742,7 +1758,7 @@ fn run_shell_stderr_is_captured() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+    let (_title, text) = rx.recv_timeout(RUN_SHELL_WAIT)
         .expect("should receive run-shell stderr output within 10s");
     assert!(
         text.contains("error-output") || text.contains("error"),

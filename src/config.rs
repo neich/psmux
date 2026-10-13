@@ -167,7 +167,7 @@ pub fn populate_default_bindings(app: &mut AppState) {
             if let Some(action) = parse_command_to_action(cmd_str) {
                 // Only add if not already present (user config may have overridden)
                 if !table.iter().any(|b| b.key == key) {
-                    table.push(Bind { key, action, repeat: false });
+                    table.push(Bind { key, action, repeat: false, note: None });
                 }
             }
         }
@@ -181,7 +181,7 @@ pub fn populate_default_bindings(app: &mut AppState) {
             let key = normalize_key_for_binding(key);
             if let Some(action) = parse_command_to_action(cmd_str) {
                 if !root_table.iter().any(|b| b.key == key) {
-                    root_table.push(Bind { key, action, repeat: false });
+                    root_table.push(Bind { key, action, repeat: false, note: None });
                 }
             }
         }
@@ -270,6 +270,42 @@ pub fn list_keys_entries(app: &AppState) -> Vec<(String, String, String, bool)> 
             if app.copy_mode_defaults_unbound.contains(&(table.to_string(), *key)) { continue; }
             out.push((table.to_string(), (*name).to_string(), (*cmd).to_string(), false));
         }
+    }
+    out
+}
+
+/// `list-keys -N` output (tmux cmd-list-keys.c, the notes_only template
+/// `#{key_prefix} #{p|W:key_string} #{?key_note,#{key_note},#{key_command}}`).
+///
+/// With `-T` it lists that table, without it the prefix table then the root
+/// table. Only bindings with a note are listed unless `-a` is given, `key`
+/// keeps the one key, and every line starts with the prefix key, as in tmux.
+pub fn list_key_notes(app: &AppState, table: Option<&str>, all: bool, key: Option<&str>) -> String {
+    let tables: Vec<&str> = match table {
+        Some(t) => vec![t],
+        None => vec!["prefix", "root"],
+    };
+    let only = key.and_then(parse_key_name).map(normalize_key_for_binding);
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for t in tables {
+        let Some(binds) = app.key_tables.get(t) else { continue };
+        for b in binds {
+            if only.is_some_and(|k| k != b.key) {
+                continue;
+            }
+            if b.note.is_none() && !all {
+                continue;
+            }
+            let text = b.note.clone().unwrap_or_else(|| crate::commands::format_action(&b.action));
+            rows.push((format_key_binding(&b.key), text));
+        }
+    }
+    let width = rows.iter().map(|(k, _)| unicode_width::UnicodeWidthStr::width(k.as_str())).max().unwrap_or(0);
+    let prefix = format_key_binding(&app.prefix_key);
+    let mut out = String::new();
+    for (k, text) in rows {
+        let pad = width.saturating_sub(unicode_width::UnicodeWidthStr::width(k.as_str()));
+        out.push_str(&format!("{} {}{} {}\n", prefix, k, " ".repeat(pad), text));
     }
     out
 }
@@ -380,6 +416,19 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
     if !continuation.is_empty() {
         lines.push((cont_start, continuation));
     }
+
+    // tmux's lexer reads `{` and `}` as tokens wherever they stand
+    // (cmd-parse.y yylex), so `if-shell C { A } { B }` on one line and a
+    // `} {` line between the two blocks are both valid. The collector below
+    // works on whole lines, so give every brace of an if-shell line, and of a
+    // line that continues one (starts with a brace), a line of its own.
+    let lines: Vec<(usize, String)> = lines
+        .into_iter()
+        .flat_map(|(lineno, line)| match split_brace_line(&line) {
+            Some(parts) => parts.into_iter().map(|p| (lineno, p)).collect::<Vec<_>>(),
+            None => vec![(lineno, line)],
+        })
+        .collect();
 
     // Brace-block collection state for if-shell 'cond' { ... } syntax.
     // When we encounter a line like `if-shell 'false' {`, we collect
@@ -513,7 +562,10 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
                     // Only process if active
                     let active = if_stack.last().map(|s| s.active).unwrap_or(true);
                     if active {
-                        app.environment.insert(name.to_string(), value.to_string());
+                        // tmux cmd-parse.y:264 puts %hidden in the GLOBAL
+                        // environment with ENVIRON_HIDDEN: usable as $NAME and
+                        // in formats, never passed to a child (#775).
+                        app.env_scopes.global_hidden.insert(name.to_string(), value.to_string());
                     }
                 }
                 continue;
@@ -531,7 +583,13 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
         // tmux's %hidden directive defines server-level variables that are
         // expanded with $ syntax in subsequent config lines.
         let l = if l.contains('$') {
-            expand_hidden_vars(l, &app.environment)
+            // %hidden entries live in the global hidden set (#775); session
+            // entries keep their old precedence over them.
+            let mut vars: std::collections::HashMap<String, String> = app.env_scopes.global_hidden
+                .iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            vars.extend(app.env_scopes.session_hidden.iter().map(|(k, v)| (k.clone(), v.clone())));
+            vars.extend(app.environment.iter().map(|(k, v)| (k.clone(), v.clone())));
+            expand_hidden_vars(l, &vars)
         } else {
             l.to_string()
         };
@@ -547,6 +605,120 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
     // Clear the line context so a later single runtime command does not inherit
     // a stale `file:line:` prefix.
     app.config_warn_line = None;
+}
+
+/// Split a config line at its block braces, for the if-shell collector.
+///
+/// Returns `None` when the line is left alone: it is not an if-shell line
+/// and does not start with a brace, or it has no block brace. Otherwise the
+/// pieces in order, where a header is kept with the `{` that opens its block
+/// (`if-shell 'c' {`) and every other brace stands alone:
+/// `if-shell 'c' { A } { B }` gives `if-shell 'c' {`, `A`, `}`, `{`, `B`, `}`.
+///
+/// A brace is a block brace the way tmux's lexer reads one: outside quotes,
+/// `{` at the start of a token, and `}` anywhere except where it closes a
+/// `#{...}` format (yylex_token, cmd-parse.y).
+pub(crate) fn split_brace_line(line: &str) -> Option<Vec<String>> {
+    let l = line.trim();
+    let candidate = l.starts_with("if-shell ")
+        || l.starts_with("if ")
+        || l.starts_with('{')
+        || l.starts_with('}');
+    if !candidate {
+        return None;
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    let mut seg = String::new();
+    let mut quote: Option<char> = None;
+    let mut format_depth = 0usize;
+    let mut at_token_start = true;
+    let mut found = false;
+    let mut chars = l.chars().peekable();
+    let flush = |seg: &mut String, pieces: &mut Vec<String>| {
+        let s = seg.trim();
+        if !s.is_empty() {
+            pieces.push(s.to_string());
+        }
+        seg.clear();
+    };
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                seg.push(c);
+                if c == '\\' && q == '"' {
+                    if let Some(n) = chars.next() {
+                        seg.push(n);
+                    }
+                } else if c == q {
+                    quote = None;
+                }
+                at_token_start = false;
+                continue;
+            }
+            None => {}
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                seg.push(c);
+                at_token_start = false;
+            }
+            '\\' => {
+                seg.push(c);
+                if let Some(n) = chars.next() {
+                    seg.push(n);
+                }
+                at_token_start = false;
+            }
+            '#' if chars.peek() == Some(&'{') => {
+                seg.push(c);
+                seg.push(chars.next().unwrap());
+                format_depth += 1;
+                at_token_start = false;
+            }
+            '}' if format_depth > 0 => {
+                seg.push(c);
+                format_depth -= 1;
+                at_token_start = false;
+            }
+            '{' if at_token_start => {
+                found = true;
+                // The header keeps its opening brace; a brace after a brace
+                // (the else block of `} {`) stands alone.
+                let s = seg.trim().to_string();
+                seg.clear();
+                if s.is_empty() {
+                    pieces.push("{".to_string());
+                } else {
+                    pieces.push(format!("{} {{", s));
+                }
+                at_token_start = true;
+            }
+            '}' => {
+                found = true;
+                flush(&mut seg, &mut pieces);
+                pieces.push("}".to_string());
+                at_token_start = true;
+            }
+            c if c.is_whitespace() => {
+                seg.push(c);
+                at_token_start = true;
+            }
+            ';' => {
+                seg.push(c);
+                at_token_start = true;
+            }
+            _ => {
+                seg.push(c);
+                at_token_start = false;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    flush(&mut seg, &mut pieces);
+    Some(pieces)
 }
 
 /// Process a collected if-shell brace block by evaluating the condition
@@ -605,6 +777,12 @@ fn process_brace_if_shell(app: &mut AppState, bb: &parse_config_content_types::B
 
     if condition.is_empty() { return; }
 
+    // A shell condition is format expanded before it runs, like tmux
+    // (cmd-if-shell.c:86); untimed, as `%` in a shell command is not strftime.
+    if !format_mode {
+        condition = crate::format::expand_format_untimed(&condition, app);
+    }
+
     // Evaluate the condition
     let success = if format_mode {
         let expanded = crate::format::expand_format(&condition, app);
@@ -624,6 +802,18 @@ fn process_brace_if_shell(app: &mut AppState, bb: &parse_config_content_types::B
 
     // Execute the appropriate branch
     let lines = if success { &bb.true_lines } else { &bb.else_lines };
+    // A branch holding a block of its own (`if-shell A { if-shell B { ... } }`)
+    // goes back through the block parser; a flat one keeps per line handling.
+    let nested = lines.iter().any(|l| {
+        let l = l.trim();
+        (l.starts_with("if-shell ") || l.starts_with("if ")) && l.ends_with('{')
+    });
+    if nested {
+        let saved = app.config_warn_line;
+        parse_config_content(app, &lines.join("\n"));
+        app.config_warn_line = saved;
+        return;
+    }
     for line in lines {
         let l = line.trim();
         if l.is_empty() || l.starts_with('#') { continue; }
@@ -883,16 +1073,31 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         }
     }
     else if l.starts_with("set-environment ") || l.starts_with("setenv ") {
-        let parts: Vec<&str> = l.split_whitespace().collect();
-        let mut i = 1;
-        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
-        if i + 1 < parts.len() {
-            let val = parts[i+1..].join(" ");
-            app.environment.insert(parts[i].to_string(), val.clone());
-            // Also set on the server process so child panes inherit via env block
-            std::env::set_var(parts[i], &val);
-        } else {
-            warn_config(app, "set-environment requires a name and value");
+        // Same parser and scopes as the CLI/TCP/prompt paths (#775): -g
+        // global, -u, -r removal marker, -h hidden, -F format value. The
+        // process environment is kept equal to what a child inherits.
+        let tokens = crate::commands::parse_command_line(l);
+        let args: Vec<&str> = tokens.iter().skip(1).map(|s| s.as_str()).collect();
+        let parsed = crate::environ::parse_set_environment(&args).or_else(|e| {
+            // psmux has always joined an unquoted multi word value; keep
+            // accepting `set-environment NAME several words` from configs.
+            if !e.starts_with("too many arguments") { return Err(e); }
+            let name_at = args.iter().position(|a| !a.starts_with('-')).unwrap_or(0);
+            let mut joined: Vec<String> = args[..=name_at].iter().map(|s| s.to_string()).collect();
+            joined.push(args[name_at + 1..].join(" "));
+            let refs: Vec<&str> = joined.iter().map(|s| s.as_str()).collect();
+            crate::environ::parse_set_environment(&refs)
+        });
+        match parsed {
+            Ok(mut a) => {
+                if a.format {
+                    if let Some(v) = a.value.take() {
+                        a.value = Some(crate::format::expand_format_untimed(&v, app));
+                    }
+                }
+                crate::environ::apply_set(&mut app.environment, &mut app.env_scopes, &a);
+            }
+            Err(e) => warn_config(app, format!("set-environment: {}", e)),
         }
     }
     else {
@@ -917,6 +1122,25 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         if matches!(cmd, "new-window" | "neww") && !app.windows.is_empty() && !in_startup_load() {
             let _ = crate::commands::execute_command_string(app, l);
             return;
+        }
+        // And for `select-pane -d/-e` / `last-pane -d/-e` (tmux PANE_INPUTOFF):
+        // a sourced file that fences a pane off must fence it, not drop the
+        // line in silence.  Same startup exclusion: there is no pane yet.
+        if !app.windows.is_empty() && !in_startup_load() {
+            let tokens = crate::commands::parse_command_line(l);
+            let args: Vec<&str> = tokens.iter().skip(1).map(|s| s.as_str()).collect();
+            let toggle = match cmd {
+                "select-pane" | "selectp" => crate::server::connection::select_pane_input_toggle(
+                    &args,
+                    crate::server::connection::select_pane_target_arg(&args),
+                ).is_some(),
+                "last-pane" | "lastp" => crate::server::connection::last_pane_input_toggle(&args).is_some(),
+                _ => false,
+            };
+            if toggle {
+                let _ = crate::commands::execute_command_string(app, l);
+                return;
+            }
         }
         if !cmd.is_empty() && !is_known_command(app, cmd) {
             warn_config(app, format!("unknown command: {}", cmd));
@@ -1829,8 +2053,21 @@ pub fn split_chained_commands_pub(command: &str) -> Vec<String> {
 ///     of spaces inside a quoted argument survive chaining (previously
 ///     `set-option @a 1 \; set-option @b "x    y"` stored `x y`).
 ///
-/// A semicolon that is only *part* of a token (`a;b`, `a; b`) is left alone,
-/// again matching tmux, which inspects the whole argument.
+/// A top-level token that *ends* with an unescaped `;` ends the command too,
+/// the `;` dropped and the rest of the token kept (#734 follow up): `-s probe;
+/// display-message -p done` is `-s probe` then `display-message -p done`. Both
+/// tmux grammars agree on that: cmd_parse_from_arguments (cmd-parse.y:1098)
+/// cuts an argument ending in `;` and ends the command there, and the string
+/// lexer ends a token at an unquoted `;` and returns the `;` as the separator
+/// (cmd-parse.y:1314 and :1675). psmux made a session named `probe;` and sent
+/// the marker to it as arguments. `\;` at the end of a token stays a literal
+/// `;` in both (cmd-parse.y:1100 and the lexer's escape).
+///
+/// A `;` in the middle of a token (`a;b`) is left alone. The two tmux grammars
+/// disagree there (an argv element `a;b` is one argument, a command string
+/// `a;b` is two commands), and the line read here is often a flattened argv
+/// whose arguments were not quoted, so splitting it would change the value of
+/// a plain `set -g @v a;b`.
 fn split_chained_commands(command: &str) -> Vec<String> {
     let chars: Vec<char> = command.chars().collect();
     let mut commands: Vec<String> = Vec::new();
@@ -1861,6 +2098,17 @@ fn split_chained_commands(command: &str) -> Vec<String> {
                 seg_start = i;
                 continue;
             }
+            // `word;` : a bare `;` closing a token (not `\;`, handled by the
+            // escape arm below, and not a `;` inside a token).
+            if c == ';' && !starts_token && ends_token && !{
+                let ts = chars[..i].iter().rposition(|ch| ch.is_whitespace()).map_or(0, |p| p + 1);
+                is_modified_semicolon_key(&chars[ts..=i].iter().collect::<String>())
+            } {
+                push_seg(&mut commands, &chars[seg_start..i]);
+                i += 1;
+                seg_start = i;
+                continue;
+            }
         }
 
         match c {
@@ -1878,37 +2126,119 @@ fn split_chained_commands(command: &str) -> Vec<String> {
     commands
 }
 
-pub fn parse_bind_key(app: &mut AppState, line: &str) {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 { return; }
-    
-    let mut i = 1;
-    let mut _key_table = "prefix".to_string();
-    let mut _repeatable = false;
-    
-    while i < parts.len() {
-        let p = parts[i];
-        // A flag must start with '-' AND be longer than 1 char (e.g. "-r", "-n", "-T").
-        // A bare "-" is a valid key name, not a flag.
-        if p.starts_with('-') && p.len() > 1 {
-            if p.contains('r') { _repeatable = true; }
-            if p.contains('n') { _key_table = "root".to_string(); }
-            if p.contains('T') {
-                i += 1;
-                if i < parts.len() { _key_table = parts[i].to_string(); }
+/// A key name for the `;` key with modifiers, such as `M-;`, `C-M-;` or `^;`.
+/// tmux needs these written `M-\;` (its lexer and its argv rule both cut the
+/// `;`), but psmux has always taken `bind -n M-; ...` as written, so a token
+/// like this does not end a command at its trailing `;`. No real argument
+/// ending a command looks like one.
+pub(crate) fn is_modified_semicolon_key(token: &str) -> bool {
+    if token == "^;" {
+        return true;
+    }
+    let mut rest = token;
+    let mut modifiers = 0;
+    while rest.len() > 2 && rest.as_bytes()[1] == b'-'
+        && matches!(rest.as_bytes()[0].to_ascii_uppercase(), b'C' | b'M' | b'S')
+    {
+        rest = &rest[2..];
+        modifiers += 1;
+    }
+    modifiers > 0 && rest == ";"
+}
+
+/// One whitespace separated token of `s` starting at or after byte `from`,
+/// quote aware: `(start, end, value)` where `value` has one level of `'...'`
+/// or `"..."` removed (and `\x` unescaped inside double quotes). Used where a
+/// flag VALUE may be quoted text, such as `bind-key -N "a note"`.
+pub(crate) fn next_quoted_token(s: &str, from: usize) -> Option<(usize, usize, String)> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let start = i;
+    let mut value = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = s[start..].char_indices().peekable();
+    let mut end = s.len();
+    while let Some((off, c)) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                if let Some((_, n)) = chars.next() {
+                    value.push(n);
+                }
             }
-            i += 1;
-        } else {
-            break;
+            Some(_) => value.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => {
+                end = start + off;
+                break;
+            }
+            None => value.push(c),
         }
     }
-    
-    if i >= parts.len() { return; }
-    let key_str = parts[i];
-    i += 1;
-    
-    if i >= parts.len() { return; }
-    let command = parts[i..].join(" ");
+    Some((start, end, value))
+}
+
+pub fn parse_bind_key(app: &mut AppState, line: &str) {
+    let mut _key_table = "prefix".to_string();
+    let mut _repeatable = false;
+    let mut note: Option<String> = None;
+
+    // The command name, then bind-key's own flags (tmux "nrN:T:"), then the
+    // key, then the command, which is kept as raw text from there on.
+    // Flags and the key are whitespace tokens taken as written (a bare `"`
+    // or `'` is a key name, not a quote); only a flag VALUE is quote aware,
+    // since a note is free text.
+    let raw_token = |from: usize| -> Option<(usize, &str)> {
+        let rest = &line[from..];
+        let skip = rest.len() - rest.trim_start().len();
+        let rest = &rest[skip..];
+        if rest.is_empty() {
+            return None;
+        }
+        let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        Some((from + skip + len, &rest[..len]))
+    };
+    let Some((mut pos, _)) = raw_token(0) else { return; };
+    let mut key_str: Option<&str> = None;
+    while let Some((end, tok)) = raw_token(pos) {
+        pos = end;
+        // A flag must start with '-' AND be longer than 1 char (e.g. "-r", "-n", "-T").
+        // A bare "-" is a valid key name, not a flag.
+        if tok.starts_with('-') && tok.len() > 1 && tok != "--" {
+            let flags = &tok[1..];
+            if flags.contains('r') { _repeatable = true; }
+            if flags.contains('n') { _key_table = "root".to_string(); }
+            // A value flag ends its cluster and takes the next argument
+            // (getopt), so `-rN note` and `-T tbl` both work.
+            if flags.ends_with('T') || flags.ends_with('N') {
+                if let Some((_, vend, val)) = next_quoted_token(line, pos) {
+                    pos = vend;
+                    if flags.ends_with('T') { _key_table = val; } else { note = Some(val); }
+                }
+            }
+            continue;
+        }
+        if tok == "--" {
+            if let Some((kend, k)) = raw_token(pos) {
+                pos = kend;
+                key_str = Some(k);
+            }
+        } else {
+            key_str = Some(tok);
+        }
+        break;
+    }
+    let Some(key_str) = key_str else { return; };
+    // The command as written, whitespace runs folded the way the old
+    // split/join did.
+    let command = line[pos..].split_whitespace().collect::<Vec<_>>().join(" ");
+    if command.is_empty() { return; }
     
     // Split on `\;` or `;` to support command chaining (like tmux `bind x split-window \; select-pane -D`)
     let sub_commands: Vec<String> = split_chained_commands(&command);
@@ -1938,7 +2268,7 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
         };
         let table = app.key_tables.entry(_key_table).or_default();
         table.retain(|b| b.key != key);
-        table.push(Bind { key, action, repeat: _repeatable });
+        table.push(Bind { key, action, repeat: _repeatable, note });
     } else {
         // Silence is what made issue #616 so hard to see: a key name the parser
         // did not understand vanished with no boot warning, nothing in
@@ -2020,7 +2350,7 @@ pub fn ensure_prefix_self_binding(app: &mut AppState) {
         return;
     }
     if let Some(action) = parse_command_to_action("send-prefix") {
-        table.push(Bind { key, action, repeat: false });
+        table.push(Bind { key, action, repeat: false, note: None });
     }
 }
 
@@ -2570,6 +2900,15 @@ fn parse_run_shell(app: &mut AppState, line: &str) {
     let shell_cmd = cmd_parts.join(" ");
     if shell_cmd.is_empty() { return; }
 
+    // Format expand the command first, like tmux (cmd-run-shell.c:144) and
+    // like the CLI and key binding paths already do. Untimed: `%` in a shell
+    // command is not strftime.
+    let shell_cmd = if shell_cmd.contains('#') {
+        crate::format::expand_format_untimed(&shell_cmd, app)
+    } else {
+        shell_cmd
+    };
+
     // Expand ~ to home directory + XDG fallback for plugin paths
     let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd);
 
@@ -2835,7 +3174,17 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
     }
 
     if positional.len() < 2 { return; }
-    let condition = &positional[0];
+    // A shell condition is format expanded before it runs, like tmux
+    // (cmd-if-shell.c:86 format_single_from_target). It went to the shell
+    // verbatim, so `if-shell 'check #{pid}'` in a config file saw the literal
+    // `#{pid}` (issue #734 follow up). Untimed: `%` in a shell command is not
+    // strftime.
+    let shell_condition = if format_mode {
+        positional[0].clone()
+    } else {
+        crate::format::expand_format_untimed(&positional[0], app)
+    };
+    let condition = &shell_condition;
     let true_cmd = &positional[1];
     let false_cmd = positional.get(2);
 
@@ -2969,3 +3318,19 @@ mod tests_issue619_set_option_already_set;
 #[cfg(test)]
 #[path = "../tests-rs/test_config_option_parity.rs"]
 mod tests_config_option_parity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_ifshell_format.rs"]
+mod tests_issue734_ifshell_format;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_side_ifshell_braces.rs"]
+mod tests_issue734_side_ifshell_braces;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_side_bind_notes.rs"]
+mod tests_issue734_side_bind_notes;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_followup_queue.rs"]
+mod tests_issue734_followup_queue;

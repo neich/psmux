@@ -216,11 +216,17 @@ fn decrqm_reports_deccolm_permanently_reset() {
 }
 
 #[test]
-fn decrqm_2026_reports_not_recognised() {
-    // Deliberately 0, not tmux's 2: psmux has no synchronized output to offer,
-    // and 0 is byte for byte what the inbox console host answers on 26200, so
-    // a pane sees the same reply under either console host.
-    assert_eq!(reply_for(b"\x1b[?2026$p", &fresh()), "\x1b[?2026;0$y");
+fn decrqm_2026_reports_reset_like_tmux() {
+    // psmux implements synchronized output (`SyncGate` in pane.rs), so it
+    // answers 2 (supported, currently reset) the way tmux does.
+    assert_eq!(reply_for(b"\x1b[?2026$p", &fresh()), "\x1b[?2026;2$y");
+}
+
+#[test]
+fn decrqm_2026_reports_set_inside_an_open_update() {
+    // tmux input.c: `case 2026: n = (s->mode & MODE_SYNC) ? 1 : 2;`
+    let st = DecrqmState { synchronized_output: true, ..fresh() };
+    assert_eq!(reply_for(b"\x1b[?2026$p", &st), "\x1b[?2026;1$y");
 }
 
 #[test]

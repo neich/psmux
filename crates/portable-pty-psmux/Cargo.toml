@@ -12,7 +12,7 @@
 [package]
 edition = "2018"
 name = "portable-pty-psmux"
-version = "0.9.7"
+version = "0.9.8"
 authors = ["Wez Furlong"]
 build = false
 include = [

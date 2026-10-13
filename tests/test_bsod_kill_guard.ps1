@@ -128,7 +128,16 @@ if ($LASTEXITCODE -ne 0) {
     if ([string]::IsNullOrWhiteSpace($panePid) -or -not ($panePid -match '^\d+$')) {
         Write-Fail "Could not read a numeric pane_pid ('$panePid')"
     } else {
-        $descendants = @(Get-DescendantPids ([uint32]$panePid))
+        # Poll rather than trust the 3 s sleep: a Store pwsh can take longer
+        # than that to appear when the machine is busy (sweep 2026-10-12_23-41,
+        # "Could not find the nested pwsh descendant", passed 3/3 on rerun).
+        $descendants = @()
+        $deadline = (Get-Date).AddSeconds(15)
+        do {
+            $descendants = @(Get-DescendantPids ([uint32]$panePid))
+            if ($descendants.Count -gt 0) { break }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
         Write-Host "  descendants at kill time: $($descendants -join ',')" -ForegroundColor DarkGray
 
         if ($descendants.Count -eq 0) {

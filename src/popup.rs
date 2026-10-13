@@ -58,6 +58,7 @@ pub fn create_popup_pane(
     pane_id: usize,
     session_name: &str,
     environment: &std::collections::HashMap<String, String>,
+    env_removals: &[String],
     host_colors: Option<&crate::types::HostColors>,
 ) -> Option<Pane> {
     let pty_sys = portable_pty::native_pty_system();
@@ -100,6 +101,10 @@ pub fn create_popup_pane(
     // query psmux for the terminal colors, so hand it the ones we already know.
     crate::pane::set_host_colors_env(&mut cmd_builder, host_colors);
     crate::pane::apply_user_environment(&mut cmd_builder, environment);
+    // Same environment as a new pane (#775): names removed with
+    // `set-environment -r` or hidden with `-h` must not come back from the
+    // registry fill (#773) in a popup either.
+    crate::pane::apply_env_removals(&mut cmd_builder, env_removals);
     // NOTE: the interactive-shell-for-empty-command behavior (tmux parity, #351)
     // is handled above where cmd_builder is constructed: an empty command uses
     // build_command(None, true, false) to launch the default shell as a REPL.
@@ -183,7 +188,7 @@ pub fn create_popup_pane(
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None, win32_input_latched: false,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
         scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape,
         bell_pending,
@@ -258,7 +263,7 @@ pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None, win32_input_latched: false,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
         scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET)),
         bell_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -507,8 +512,20 @@ pub fn serialize_floats_json(app: &AppState) -> String {
         );
         out.push_str(&json_escape_string(&fp.title));
         out.push_str("\",\"rows\":[");
+        // The float's own cursor, so the client can put the terminal cursor
+        // inside the focused float the way tmux does for its active pane
+        // (#767). Without it the client only knew the tiled active pane's
+        // cursor and left the cursor there while typing went into the float.
+        let mut cur_row: u16 = 0;
+        let mut cur_col: u16 = 0;
+        let mut cur_hidden = false;
         if let Ok(parser) = fp.pane.term.lock() {
-            let rows_data = serialize_screen_rows(parser.screen(), inner_h, inner_w);
+            let screen = parser.screen();
+            let (cr, cc) = screen.cursor_position();
+            cur_row = cr;
+            cur_col = cc;
+            cur_hidden = screen.hide_cursor();
+            let rows_data = serialize_screen_rows(screen, inner_h, inner_w);
             for (j, row) in rows_data.iter().enumerate() {
                 if j > 0 {
                     out.push(',');
@@ -534,7 +551,14 @@ pub fn serialize_floats_json(app: &AppState) -> String {
                 out.push_str("]}");
             }
         }
-        out.push_str("]}");
+        out.push(']');
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                ",\"cursor_row\":{},\"cursor_col\":{},\"hide_cursor\":{}}}",
+                cur_row, cur_col, cur_hidden
+            ),
+        );
     }
     out.push(']');
     out

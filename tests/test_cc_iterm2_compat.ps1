@@ -179,13 +179,16 @@ else { F "marker '$marker' not in %output stream" }
 # ============================================================
 Hdr "Layer 5: Live state notifications"
 Send-CC $cc "new-window -n liveA"
-[void](Read-Reply $cc 2000)
-$ev = Drain-Notifications $cc 1500
+# A notification may arrive before the command's %end (tmux makes no ordering
+# promise between the two), so keep what Read-Reply consumed: discarding it
+# lost %window-add once in sweep 2026-10-12_23-41 while the new window's
+# %output %2 was plainly there.
+$ev = (Read-Reply $cc 2000) + (Drain-Notifications $cc 1500)
 if ($ev -match "%window-add @\d+") { P "%window-add on new-window" } else { F "no %window-add: $ev" }
 
 Send-CC $cc "rename-window -t liveA liveA_renamed"
-[void](Read-Reply $cc 1500)
-$ev = Drain-Notifications $cc 1000
+$reply = Read-Reply $cc 1500
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%window-renamed @\d+ liveA_renamed") { P "%window-renamed" } else { F "no %window-renamed" }
 
 # Select first window by index 0 to fire after-select-window.
@@ -203,15 +206,15 @@ if ($ev -match "%session-window-changed \`$\d+ @\d+") {
 else { F "no %session-window-changed: reply=[$($reply.Trim())] drain=[$($ev.Trim())]" }
 
 Send-CC $cc "kill-window -t liveA_renamed"
-[void](Read-Reply $cc 1500)
-$ev = Drain-Notifications $cc 1000
+$reply = Read-Reply $cc 1500
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%window-close @\d+") { P "%window-close on kill-window" } else { F "no %window-close: $ev" }
 
 # rename-session
 Send-CC $cc "rename-session -t $S ${S}_renamed"
-[void](Read-Reply $cc 1500)
+$reply = Read-Reply $cc 1500
 Start-Sleep -Milliseconds 400
-$ev = Drain-Notifications $cc 1000
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%session-renamed ${S}_renamed") { P "%session-renamed" }
 else { F "no %session-renamed: $ev" }
 # Update tracking name

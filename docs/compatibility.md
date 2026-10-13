@@ -105,6 +105,17 @@ Multiple commands can be chained with `;` on a single line, matching tmux behavi
 bind-key M-s split-window -h \; select-pane -L
 ```
 
+From the command line, a `;` or `\;` given as its own argument separates commands the same way. The commands run in order; the first command that fails (including an unknown command) ends the list, and its error is printed with exit status 1:
+
+```powershell
+psmux select-pane -t work ';' set-option -t work @ready yes
+psmux new-session -d -s dev ';' split-window -h ';' select-layout even-horizontal
+```
+
+Commands that stay on the session the first command was routed to go to its server over one connection. A command that names another session (or a `%N`, `@N` or `$N` id, whose owner the CLI looks up), and commands that work on the client or across every session (`list-sessions`, `kill-server`, `has-session`, `kill-session`, `run-shell`, `if-shell`, `switch-client`, `detach-client`), run as their own invocation, exactly as they do alone. After `new-session`, the rest of the list runs on the session it created, before the client attaches. `bind-key`, `set-hook`, `confirm-before`, `command-prompt`, `display-menu`, `start-server` and `attach-session` still take the whole line as their own arguments.
+
+Unlike tmux, which parses the whole list before running any of it, commands before an unknown command have already run when it is reported.
+
 ### Run Shell Output
 
 `run-shell` now displays output in the status bar, matching tmux behavior. Background mode with `-b` runs fire and forget.
@@ -162,7 +173,7 @@ The `-F` flag on `bind-key` now properly expands format variables, enabling plug
 
 ### Set Environment
 
-`set-environment` and `show-environment` are fully functional. Environment variables set with `set-environment -g` are inherited by all new panes at the process level (no shell commands echoed). The `new-session -e VAR=val` flag also sets session environment correctly.
+`set-environment` and `show-environment` follow tmux: `-g` global vs session scope, `-u`, `-r` removal markers (`-NAME`), `-h` hidden entries, `-F`, `show-environment NAME` with `unknown variable: NAME` at exit 1, and `-s` shell output. The global environment is the session server's start environment, since psmux runs one server per session. Variables are inherited by new panes at the process level (no shell commands echoed). The `new-session -e VAR=val` flag also sets session environment correctly.
 
 ### Unbind All Keys
 
@@ -207,6 +218,10 @@ The `#{window_zoomed_flag}` format variable is correctly maintained during zoom/
 ### Title-only `select-pane`
 
 `select-pane -T` and `select-pane -P` set the pane title or style without moving the active window or pane, matching tmux (#592). Only a direction flag or `-l` changes focus.
+
+### Pane Input Off (`select-pane -d` / `-e`)
+
+`select-pane -d` stops input from reaching a pane's program and `select-pane -e` lets it through again, tmux's `PANE_INPUTOFF`; `#{pane_input_off}` reports which. Neither selects the pane. While input is off, typed keys, `send-keys` in every form, `paste-buffer` and forwarded mouse events are dropped and `synchronize-panes` leaves the pane out, while copy mode, `send-keys -X` and psmux's answers to the program's terminal queries keep working. The flag survives `respawn-pane`. See [tmux_args_reference.md](tmux_args_reference.md) for the details. Earlier releases accepted both flags and ignored them.
 
 ### Bare Command Routing
 

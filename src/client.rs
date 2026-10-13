@@ -36,6 +36,46 @@ pub(crate) struct FloatJson {
     #[serde(default)] pub focused: bool,
     #[serde(default)] pub title: String,
     #[serde(default)] pub rows: Vec<crate::layout::RowRunsJson>,
+    /// The float's own cursor, content relative (#767).
+    #[serde(default)] pub cursor_row: u16,
+    #[serde(default)] pub cursor_col: u16,
+    #[serde(default)] pub hide_cursor: bool,
+}
+
+/// Content rect of a float on screen: the same placement and border inset
+/// `render_float_overlays` draws it with. `None` for a float too small to draw.
+pub(crate) fn float_inner_rect(content_chunk: Rect, fl: &FloatJson) -> Option<Rect> {
+    if fl.w < 2 || fl.h < 2 { return None; }
+    let w = fl.w.min(content_chunk.width);
+    let h = fl.h.min(content_chunk.height);
+    let x = content_chunk.x + fl.x.min(content_chunk.width.saturating_sub(w));
+    let y = content_chunk.y + fl.y.min(content_chunk.height.saturating_sub(h));
+    if fl.border == "none" {
+        Some(Rect { x, y, width: w, height: h })
+    } else {
+        Some(Rect { x: x + 1, y: y + 1, width: w.saturating_sub(2), height: h.saturating_sub(2) })
+    }
+}
+
+/// Where the terminal cursor goes when a floating pane holds the focus (#767).
+///
+/// tmux puts the cursor in the active pane, and a focused floating pane IS
+/// the active pane, so the cursor sits at that pane's cursor inside the float
+/// (`server_client_reset_state`, server-client.c, using `wp->xoff`/`wp->yoff`
+/// of the floating pane). The outer `None` means no float is focused, so the
+/// tiled active pane decides. `Some(None)` means a float is focused but its
+/// cursor is hidden (or the float cannot be drawn): the cursor must not fall
+/// back to the tiled pane behind it.
+pub(crate) fn focused_float_cursor(content_chunk: Rect, floats: &[FloatJson]) -> Option<Option<(u16, u16)>> {
+    let fl = floats.iter().rev().find(|fl| fl.focused)?;
+    let inner = match float_inner_rect(content_chunk, fl) {
+        Some(r) if r.width > 0 && r.height > 0 => r,
+        _ => return Some(None),
+    };
+    if fl.hide_cursor { return Some(None); }
+    let cx = inner.x + fl.cursor_col.min(inner.width - 1);
+    let cy = inner.y + fl.cursor_row.min(inner.height - 1);
+    Some(Some((cx, cy)))
 }
 
 /// Extract the `-T <table>` argument of a `switch-client` command line.
@@ -171,6 +211,92 @@ pub fn dispatch_binding_commands(binding: &str) -> BindingDispatch {
     BindingDispatch::Commands { cmds, latch }
 }
 
+/// Keeps the attached client's `switch-client -T` latch in step with the key
+/// table the server holds.
+///
+/// tmux has a single `c->keytable`: a `switch-client -T` run from a binding,
+/// the command prompt, the CLI, run-shell or a hook all write it, and the next
+/// key is looked up in it. psmux dispatches keys in the client, so a table the
+/// server set behind the client's back (everything except a binding the client
+/// dispatched itself) used to change `#{client_key_table}` and nothing else:
+/// the next key still went to root.
+///
+/// The server reports its table in every state frame. A change there that the
+/// client did not cause itself is adopted as the client's latch. The client's
+/// own writes (the reset to root before a latched key's binding, a binding's
+/// `switch-client -T`, the drop on the prefix key) are queued, so their echoes,
+/// including a frame that was already in flight when a fast second key landed,
+/// never re-arm a latch the client has just consumed.
+///
+/// It also holds the session's `key-table` option (tmux
+/// `server_client_get_key_table`): the table a client returns to after every
+/// key, root unless set. A latch naming it is no latch at all.
+#[derive(Debug, Default)]
+pub(crate) struct KeyTableSync {
+    last_server: Option<String>,
+    own_writes: std::collections::VecDeque<Option<String>>,
+    /// The session's `key-table`; empty means root.
+    default: String,
+}
+
+impl KeyTableSync {
+    /// The table keys are looked up in when nothing is latched.
+    pub(crate) fn default_table(&self) -> &str {
+        if self.default.is_empty() { "root" } else { &self.default }
+    }
+
+    /// The server reported the session's `key-table` (absent = root).
+    pub(crate) fn set_default(&mut self, table: Option<&str>) {
+        self.default = match table {
+            Some(t) if t != "root" => t.to_string(),
+            _ => String::new(),
+        };
+    }
+
+    /// The server stores the default table as no table at all.
+    fn normalize(&self, table: Option<&str>) -> Option<String> {
+        match table {
+            None => None,
+            Some(t) if t == self.default_table() => None,
+            Some(t) => Some(t.to_string()),
+        }
+    }
+
+    /// The latch a binding's `switch-client -T` leaves: naming the default
+    /// table puts the client on it, which is the unlatched state.
+    pub(crate) fn latch_for(&self, table: Option<String>) -> Option<String> {
+        self.normalize(table.as_deref())
+    }
+
+    /// The client sent the server a table change of its own.
+    pub(crate) fn note_own_write(&mut self, table: Option<&str>) {
+        if self.own_writes.len() >= 32 {
+            self.own_writes.pop_front();
+        }
+        let v = self.normalize(table);
+        self.own_writes.push_back(v);
+    }
+
+    /// A state frame reported `server` as the server's table. Returns
+    /// `Some(latch)` when the client must adopt it (`Some(None)` = back to the
+    /// default table).
+    pub(crate) fn on_server_table(&mut self, server: Option<&str>) -> Option<Option<String>> {
+        let v = self.normalize(server);
+        if let Some(pos) = self.own_writes.iter().position(|w| *w == v) {
+            // An echo of the client's own write: the latch already says so.
+            self.own_writes.drain(..=pos);
+            self.last_server = v;
+            return None;
+        }
+        if v != self.last_server {
+            self.last_server = v.clone();
+            self.own_writes.clear();
+            return Some(v);
+        }
+        None
+    }
+}
+
 /// Extract the actual command from a confirm-before argument string.
 /// Handles: `confirm-before -p 'prompt text' kill-pane`
 /// Returns the command to execute after confirmation (e.g. "kill-pane").
@@ -298,6 +424,59 @@ fn parse_command_prompt_args(args: &str) -> CommandPromptSpec {
 /// A session header is `is_win == true` with `win_id == usize::MAX`.
 pub(crate) type TreeRow = (bool, usize, usize, String, String);
 
+/// A kill one of the choosers has asked about: the question on screen, and
+/// which row it names. The answer acts only when the cursor is still on that
+/// row, because the mouse wheel can move it while the question is up, where
+/// tmux's prompt holds the terminal and nothing can move under it.
+pub(crate) struct ChooserKill {
+    /// The confirm box's text, without the `? (y/n)` the box adds.
+    pub prompt: String,
+    /// The tree chooser's window id, or `None` in the session chooser, whose
+    /// rows are sessions.
+    pub window: Option<usize>,
+    /// The session the row belongs to, which in the session chooser is the row
+    /// itself.
+    pub session: String,
+}
+
+/// Whether a key answers a chooser's kill question with yes. tmux asks with
+/// `status_prompt_set(... PROMPT_SINGLE ...)`, which takes a single key, and
+/// its callback kills only when that key was `y` (`window-tree.c:1306` and
+/// `:1137`), so every other key cancels.
+pub(crate) fn chooser_kill_confirmed(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
+}
+
+/// Make a window or pane current in ANOTHER session's server before the
+/// client switches to it, so choosing a row of that session in the tree lands
+/// on that row (discussion #776). `focus` is one `focus-window <id>` or
+/// `focus-pane <id>` line. Written on an authenticated connection of its own
+/// and closed, so the server runs it before the switching client attaches.
+fn chooser_focus_in_session(session: &str, focus: &str) {
+    let Ok(port_str) = std::fs::read_to_string(crate::paths::port_file(session)) else { return };
+    let Ok(port) = port_str.trim().parse::<u16>() else { return };
+    let key = read_session_key(session).unwrap_or_default();
+    let _ = crate::session::send_auth_cmd(&format!("127.0.0.1:{}", port), key.trim(), focus.as_bytes());
+}
+
+/// What the tree chooser's kill question names. Its rows are built as
+/// `"  2: bash* (1 panes)"`, and tmux's own question carries the window index
+/// alone, `"Kill window 2? "` (`window-tree.c:1295`), so the part in front of
+/// the colon is what the question takes.
+pub(crate) fn chooser_kill_target(label: &str) -> String {
+    let label = label.trim();
+    label.split(':').next().unwrap_or(label).trim().to_string()
+}
+
+/// The session chooser's kill question. Its rows are registry bases, which
+/// under `-L ns` carry the `ns__` prefix, so the question names the session
+/// the way the user typed it, as tmux's "Kill session %s? " names `s->name`
+/// (`window-tree.c:1498`), and not the prefixed file stem.
+pub(crate) fn chooser_kill_session_prompt(current_session: &str, row: &str) -> String {
+    let ns = crate::session::session_namespace(current_session);
+    format!("kill-session {}", crate::session::display_session_name(ns, row))
+}
+
 /// Classify every row of a choose-tree model so the tmux line rules in
 /// `crate::choose_tree` can be applied to it.
 pub(crate) fn tree_row_kinds(rows: &[TreeRow]) -> Vec<crate::choose_tree::RowKind> {
@@ -330,6 +509,20 @@ pub(crate) fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
     } else {
         format!("{}{}", prefix, base)
     }
+}
+
+/// The `send-key` name for an Escape key event (issue #766).
+///
+/// A front end that writes `ESC ESC` in one write reaches the client, on the
+/// console input route, as ONE Alt+Escape key record: conhost's input parser
+/// reads an ESC in front of another key as the Alt prefix, exactly as it turns
+/// `ESC a` into Alt+a.  Naming that "esc" threw the Alt away and the pane read
+/// a single ESC.  tmux reads the same bytes as M-Escape (tty-keys.c) and
+/// writes M-Escape to the pane as `\033\033` (input-keys.c, the meta prefix),
+/// so Alt is kept here and the server writes both bytes.  Ctrl and Shift have
+/// no encoding of their own on Escape, in tmux as here, so they stay "esc".
+pub(crate) fn escape_key_name(mods: KeyModifiers) -> &'static str {
+    if mods.contains(KeyModifiers::ALT) { "M-Escape" } else { "esc" }
 }
 
 /// Extract selected text from the layout tree given absolute terminal coordinates.
@@ -2480,6 +2673,15 @@ fn establish_connection_with_timeout(
     // results were discarded; now they are at least reported when the reconnect
     // trace is on.
     let persistent_res = writer.write_all(b"PERSISTENT\n");
+    // This client's environment, for the server's update-environment (tmux's
+    // client sends its environ in MSG_IDENTIFY_ENVIRON, #775). It must come
+    // BEFORE client-attach, which is what applies it.
+    {
+        use base64::Engine;
+        let block = crate::client_env::encode_env_block(std::env::vars_os());
+        let line = format!("client-environ {}\n", base64::engine::general_purpose::STANDARD.encode(&block));
+        let _ = writer.write_all(line.as_bytes());
+    }
     let attach_res = writer.write_all(b"client-attach\n");
     if (persistent_res.is_err() || attach_res.is_err()) && crate::debug_log::reconnect_log_enabled() {
         crate::debug_log::reconnect_log(&format!(
@@ -2875,6 +3077,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // default (root) table. The prefix key always wins and forces the prefix
     // table, exactly as in `server_client_handle_key`'s `table_changed` block.
     let mut key_table_latch: Option<String> = None;
+    // Tables the server set without the client (CLI, command prompt,
+    // run-shell, hooks) arrive in the state frame and are adopted here.
+    let mut key_table_sync = KeyTableSync::default();
     // Track whether IME was open before we suppressed it for prefix mode (issue #286).
     #[cfg(windows)]
     let mut ime_was_open = false;
@@ -2891,7 +3096,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut pane_title_buf = String::new();
     let mut command_input = false;
     let mut command_buf = String::new();
-    let mut command_cursor: usize = 0;
+    // Characters from the END of `command_buf`, the way the shared prompt
+    // editor and the rename overlay count (`copy_mode::prompt_edit`).
+    let mut command_back: usize = 0;
     let mut command_history: Vec<String> = Vec::new();
     let mut command_history_idx: usize = 0;
     // Template for command-prompt -I '#W' 'rename-window "%%"' style bindings.
@@ -2921,6 +3128,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut tree_vis_map: Vec<usize> = Vec::new();
     let mut tree_selected: usize = 0;
     let mut tree_scroll: usize = 0;
+    // How many list rows each chooser drew on its last frame. tmux pages by
+    // `mtd->height`, the list height (mode-tree.c:1318-1333), so Page Up and
+    // Page Down read these instead of a fixed 10 (discussion #776).
+    let mut tree_page_h: usize = 10;
+    let mut session_page_h: usize = 10;
+    let mut buffer_page_h: usize = 10;
     let mut buffer_chooser = false;
     let mut buffer_entries: Vec<(usize, usize, String)> = Vec::new();  // (index, byte_len, preview)
     let mut buffer_selected: usize = 0;
@@ -2961,6 +3174,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut popup_initial_offset: (i32, i32) = (0, 0);
     let mut popup_rect_last: Option<Rect> = None;
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
+    // The kill a chooser's `x` has asked about and is waiting on, with the
+    // chooser still open behind it, the way tmux's `status_prompt_set(...
+    // PROMPT_SINGLE ...)` leaves the mode open behind its own prompt
+    // (`window-tree.c:1306`).
+    let mut chooser_kill: Option<ChooserKill> = None;
+    // Whether any overlay was up on the previous loop pass, so the pass that
+    // closes one still draws a frame (#767): see `overlay_closed` below.
+    let mut prev_overlays_active = false;
     let current_session = name.clone();
     // What the session is CALLED, as against `current_session`, which is the
     // port file base: under `-L ns` the base reads `ns__name`, and it is read
@@ -3070,6 +3291,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // One log line per held group, not one per loop turn.
     #[cfg(windows)]
     let mut paste_head_logged = false;
+    // Whether the key that opened the current pending group was a character
+    // typed with Shift alone (issue #766, see PasteHeadEvidence::shifted_head).
+    #[cfg(windows)]
+    let mut paste_head_shifted = false;
 
     // Track whether a modified Enter Press was already handled this keypress
     // cycle.  WezTerm sends Shift+Enter as Release-only (no Press), so we
@@ -3299,6 +3524,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a)
         #[serde(default)]
         defaults_suppressed: bool,
+        /// The key table the server holds for this client (`switch-client -T`),
+        /// absent for root. See `KeyTableSync`.
+        #[serde(default)]
+        key_table: Option<String>,
+        /// The session's `key-table` option, absent for root.
+        #[serde(default)]
+        default_key_table: Option<String>,
         /// scroll-enter-copy-mode option (mirror of server-side AppState field).
         /// When false, root key bindings that enter copy mode (e.g. PageUp ->
         /// copy-mode -u) are skipped so the key reaches the PTY (#284).
@@ -4054,6 +4286,50 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 modified_enter_press_handled = false;
                             }
                         }
+                        // A key that arrives after a held paste has gone quiet
+                        // is not part of that paste (issue #766). The paste goes
+                        // out first, as its own bracketed paste, and the key is
+                        // handled after it, in the order the two were written.
+                        // Before this, stage 2 kept holding the paste until its
+                        // 300 ms window ran out and appended whatever came in
+                        // meanwhile, so an Enter written 150 ms after a paste
+                        // reached the pane as `text CR ESC[201~`, a pasted
+                        // newline instead of a submit. Chars pushed earlier in
+                        // this same batch count as arriving now: they came in
+                        // together with this key, so there was no gap.
+                        #[cfg(windows)]
+                        {
+                            if paste_pend.len() != paste_seen_len {
+                                paste_seen_len = paste_pend.len();
+                                paste_last_growth = if paste_pend.is_empty() { None } else { Some(Instant::now()) };
+                            }
+                            let quiet = paste_last_growth.map_or(Duration::MAX, |t| t.elapsed());
+                            if stage2_paste_ended_by_new_key(paste_stage2, !paste_pend.is_empty(), quiet) {
+                                if input_log_enabled() {
+                                    input_log("paste", &format!(
+                                        "stage2 paste ended by a key after {} ms quiet, sending {} chars as send-paste before it",
+                                        quiet.as_millis(), paste_pend.len()));
+                                }
+                                paste_gesture.record(&paste_pend);
+                                let encoded = base64_encode(&paste_pend);
+                                cmd_batch.push(format!("send-paste {}\n", encoded));
+                                paste_pend.clear();
+                                paste_pend_start = None;
+                                paste_stage2 = false;
+                                paste_seen_len = 0;
+                                paste_last_growth = None;
+                                // Same reason as the stage 2 timeout send: a late
+                                // Ctrl+V Release must not read the clipboard back,
+                                // and nothing that follows is discarded.
+                                paste_fallback_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                            }
+                            // The key that opens a pending group decides whether
+                            // its head is a shifted character (issue #766).
+                            if paste_pend.is_empty() {
+                                paste_head_shifted = key.modifiers == KeyModifiers::SHIFT
+                                    && matches!(key.code, KeyCode::Char(c) if c != ' ');
+                            }
+                        }
                         // Flush pending paste buffer before processing any non-bufferable key.
                         // Bufferable keys are: plain Char, Space, Enter (if pend non-empty), Tab (if pend non-empty).
                         #[cfg(windows)]
@@ -4333,7 +4609,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             }
                         }
                         else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
-                            if session_chooser && !session_filter.is_empty() {
+                            if chooser_kill.is_some() {
+                                // Escape answers a chooser's kill question with
+                                // "no" and leaves the chooser open, which is
+                                // what tmux's single key prompt does with any
+                                // key that is not `y`. Without this the branch
+                                // below would take Escape and close the chooser
+                                // under the question.
+                                chooser_kill = None;
+                            } else if session_chooser && !session_filter.is_empty() {
                                 let selected_entry = session_filter_escape_selection(
                                     &session_entries,
                                     &session_filter,
@@ -4346,7 +4630,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 session_num_buffer.clear();
                             } else {
                                 command_input = false;
-                                command_cursor = 0;
+                                command_back = 0;
                                 command_template = None;
                                 command_prompt_label = None;
                                 renaming = false;
@@ -4382,7 +4666,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             rsel_end = None;
                             selection_changed = true;
                         }
-                        else if is_prefix && !prefix_armed {
+                        // An open prompt takes the key first, the prefix key
+                        // included. tmux hands a key to `status_prompt_key`
+                        // before the key table that holds the prefix is even
+                        // looked at (`server-client.c:1485` to `:1489`, tag
+                        // 3.7c), so `C-b` at a prompt with the default prefix
+                        // moves the cursor one character left. psmux armed the
+                        // prefix instead, which left the prompt's own `C-b`
+                        // unreachable on a default configuration and ate the
+                        // next key as a prefix command. Only the two prompts
+                        // with an editor are excluded here; the pane title and
+                        // window index prompts and the choosers keep what they
+                        // had.
+                        else if is_prefix && !prefix_armed && !command_input && !renaming {
                             // Suppress IME while in prefix mode so command keys
                             // are not intercepted by the input method (issue #286).
                             #[cfg(windows)]
@@ -4391,6 +4687,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             // forces a switch to the prefix table", so a
                             // pending `switch-client -T` latch is dropped here.
                             key_table_latch = None;
+                            // prefix-begin clears the server's table too.
+                            key_table_sync.note_own_write(None);
                             prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into());
                         }
                         // NOTE: when the prefix key is pressed while the prefix is
@@ -4412,22 +4710,43 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         else if !prefix_armed && key_table_latch.is_none() && !command_input && !renaming && !pane_renaming && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             synced_bindings.iter().any(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                                 // Skip scroll-triggered copy mode bindings when option is off (#284)
                                 && !(!scroll_enter_copy_mode && crate::copy_mode::is_page_up_copy_mode_command(&b.c))
                             })
                         } {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             if let Some(entry) = synced_bindings.iter().find(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                                 && !(!scroll_enter_copy_mode && crate::copy_mode::is_page_up_copy_mode_command(&b.c))
                             }) {
                                 if entry.c == "detach-client" || entry.c == "detach" {
                                     quit = true;
                                 } else {
-                                    // Split on \; to support command chaining (issue #192)
-                                    let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
-                                    cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                    // A root binding goes through the same
+                                    // dispatch as a prefix or latched one, so a
+                                    // `bind -n F6 switch-client -T mytbl` latches
+                                    // the table for the next key. Forwarding the
+                                    // chain verbatim told the server (so
+                                    // #{client_key_table} said mytbl) but never
+                                    // armed the client, which kept looking the
+                                    // next key up in root. Chaining on \; is
+                                    // preserved (issue #192).
+                                    match dispatch_binding_commands(&entry.c) {
+                                        BindingDispatch::SessionNav { .. } => {
+                                            // Unchanged: root session
+                                            // navigation stays a server command.
+                                            let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
+                                            cmd_batch.extend(binding_wire_lines(&sub_cmds));
+                                        }
+                                        BindingDispatch::Commands { cmds, latch } => {
+                                            cmd_batch.extend(binding_wire_lines(&cmds));
+                                            if latch.is_some() {
+                                                key_table_sync.note_own_write(latch.as_deref());
+                                                key_table_latch = key_table_sync.latch_for(latch);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4464,7 +4783,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             // client's own latch, which `take()` above has
                             // already cleared.
                             if latched_table.is_some() {
-                                cmd_batch.push("switch-client -T root\n".into());
+                                // Back to the session's key-table, which is
+                                // root unless `key-table` is set.
+                                cmd_batch.push(format!("switch-client -T {}\n",
+                                    crate::util::quote_arg_if_needed(key_table_sync.default_table())));
+                                key_table_sync.note_own_write(None);
                             }
 
                             // Check synced bindings from server (includes defaults from PREFIX_DEFAULTS)
@@ -4473,11 +4796,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 b.t == active_table && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                             });
                             // tmux: a key with no binding in a custom table
-                            // falls back to the root table before being
-                            // swallowed ("trying in root table").
+                            // falls back to the default table (root unless
+                            // `key-table` is set) before being swallowed
+                            // ("trying in root table").
                             if user_binding.is_none() && latched_table.is_some() {
                                 user_binding = synced_bindings.iter().find(|b| {
-                                    b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
+                                    b.t == key_table_sync.default_table() && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                                 });
                             }
                             if let Some(entry) = user_binding {
@@ -4525,7 +4849,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         .replace("#{window_name}", &active_window_name)
                                         .replace("#S", &session_label)
                                         .replace("#{session_name}", &session_label);
-                                    command_cursor = command_buf.len();
+                                    command_back = 0;
                                     command_template = spec.template;
                                     command_prompt_label = spec.label;
                                 } else if cmd == "list-keys" {
@@ -4562,7 +4886,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         BindingDispatch::Commands { cmds, latch } => {
                                             cmd_batch.extend(binding_wire_lines(&cmds));
                                             if latch.is_some() {
-                                                key_table_latch = latch;
+                                                key_table_sync.note_own_write(latch.as_deref());
+                                                key_table_latch = key_table_sync.latch_for(latch);
                                             }
                                         }
                                     }
@@ -4643,7 +4968,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // because the `.` fallback below sets one and
                                 // this table is read before the first state dump
                                 // has a chance to rebuild either prompt.
-                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len(); command_template = None; command_prompt_label = None; }
+                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_back = 0; command_history_idx = command_history.len(); command_template = None; command_prompt_label = None; }
                                 KeyCode::Char('\'') => { window_idx_input = true; window_idx_buf.clear(); }
                                 // Same command as the PREFIX_DEFAULTS entry for
                                 // `.`, so the key is not dead for the moment
@@ -4651,7 +4976,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('.') => {
                                     command_input = true;
                                     command_buf.clear();
-                                    command_cursor = 0;
+                                    command_back = 0;
                                     command_history_idx = command_history.len();
                                     command_template = Some("move-window -t '%%'".into());
                                     command_prompt_label = Some("(move-window)".into());
@@ -4752,24 +5077,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         tree_all.push((true, usize::MAX, 0,
                                             format!("{}: {} windows{}", sess_name, nw, attached),
                                             sess_name.clone()));
-                                        if is_current {
-                                            for (wid, wname, active, panes, disp) in wins.iter() {
-                                                let marker = if *active { "*" } else { "" };
-                                                if *active { active_tree_row = Some(tree_all.len()); }
-                                                tree_all.push((true, *wid, 0,
-                                                    format!("  {}: {}{} ({} panes)", disp, wname, marker, panes.len()),
-                                                    sess_name.clone()));
-                                                for (pid, ptitle) in panes {
-                                                    tree_all.push((false, *wid, *pid,
-                                                        format!("    {}", ptitle),
-                                                        sess_name.clone()));
-                                                }
-                                            }
-                                        } else {
-                                            for (wid, wname, active, panes, disp) in wins.iter() {
-                                                let marker = if *active { "*" } else { "" };
-                                                tree_all.push((true, *wid, 0,
-                                                    format!("  {}: {}{} ({} panes)", disp, wname, marker, panes.len()),
+                                        // Every session's windows carry their panes, as
+                                        // tmux's window_tree_build_window builds pane items
+                                        // for every window of every session. Only the
+                                        // current session's rows used to get them, so
+                                        // another session's windows had nothing to expand
+                                        // (discussion #776, note 3).
+                                        for (wid, wname, active, panes, disp) in wins.iter() {
+                                            let marker = if *active { "*" } else { "" };
+                                            if *active && is_current { active_tree_row = Some(tree_all.len()); }
+                                            tree_all.push((true, *wid, 0,
+                                                format!("  {}: {}{} ({} panes)", disp, wname, marker, panes.len()),
+                                                sess_name.clone()));
+                                            for (pid, ptitle) in panes {
+                                                tree_all.push((false, *wid, *pid,
+                                                    format!("    {}", ptitle),
                                                     sess_name.clone()));
                                             }
                                         }
@@ -5039,7 +5361,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             // ten VISIBLE lines and M-a..M-z on lines 10..35, so the
                             // key is a zero based visible line index.
                             let mut effective_code = key.code;
-                            if tree_chooser {
+                            if tree_chooser && chooser_kill.is_none() {
                                 let jump = match key.code {
                                     KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
                                         crate::choose_tree::meta_line(c)
@@ -5056,7 +5378,160 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     }
                                 }
                             }
+                            // tmux `mode_tree_key` aliases the choosers did not
+                            // know (discussion #776): `q` and `C-g` exit every
+                            // mode (mode-tree.c:1289-1293), `C-p`/`C-n`/`C-b`/`C-f`
+                            // move like Up/Down/PageUp/PageDown (:1301, :1307,
+                            // :1319, :1327), and in the tree, whose rows have
+                            // depth, `h`/`-` collapse and `l`/`+` expand like
+                            // Left/Right (:1390-1412). Each alias becomes the key
+                            // the chooser already handles. A session filter
+                            // being typed keeps its printable keys.
+                            let mut chooser_exit = false;
+                            let filter_typing = session_chooser
+                                && session_filter_active
+                                && !key.modifiers.contains(KeyModifiers::CONTROL);
+                            if (tree_chooser || session_chooser || buffer_chooser)
+                                && chooser_kill.is_none()
+                                && !filter_typing
+                                && effective_code == key.code
+                            {
+                                use crate::choose_tree::ModeKey;
+                                match crate::choose_tree::mode_tree_alias(key.code, key.modifiers, tree_chooser) {
+                                    Some(ModeKey::Exit) => chooser_exit = true,
+                                    Some(ModeKey::Up) => effective_code = KeyCode::Up,
+                                    Some(ModeKey::Down) => effective_code = KeyCode::Down,
+                                    Some(ModeKey::PageUp) => effective_code = KeyCode::PageUp,
+                                    Some(ModeKey::PageDown) => effective_code = KeyCode::PageDown,
+                                    Some(ModeKey::Collapse) => effective_code = KeyCode::Left,
+                                    Some(ModeKey::Expand) => effective_code = KeyCode::Right,
+                                    None => {}
+                                }
+                            }
                             match effective_code {
+                                // A chooser's kill question takes the very next key, as
+                                // tmux's prompt does: it is set with PROMPT_SINGLE, so it
+                                // ends on one key (`window-tree.c:1306`), and its callback
+                                // kills only when that key was `y` (`:1137`). The chooser is
+                                // still open underneath either way, as tmux's mode is. This
+                                // arm comes before the chooser arms because theirs absorb
+                                // every remaining printable key, so an answer placed after
+                                // them would never be seen.
+                                code if chooser_kill.is_some() => {
+                                    // The question comes down whatever the key was, and
+                                    // survives as an answer only if that key was a yes.
+                                    let asked = chooser_kill.take().filter(|_| chooser_kill_confirmed(code));
+                                    if let Some(asked) = asked {
+                                        if tree_chooser {
+                                            // Copy out the fields we need so the immutable borrow
+                                            // ends before we mutate the model below.
+                                            if let Some((is_win, wid, sess_name)) = tree_entries
+                                                .get(tree_selected)
+                                                .map(|(iw, w, _p, _l, s)| (*iw, *w, s.clone()))
+                                            {
+                                                if is_win
+                                                    && Some(wid) == asked.window
+                                                    && sess_name == asked.session
+                                                    && sess_name == current_session
+                                                {
+                                                    cmd_batch.push(format!("focus-window {}\n", wid));
+                                                    cmd_batch.push("kill-window\n".into());
+                                                    // Drop the killed window and the panes underneath
+                                                    // it from the model, then rebuild the visible
+                                                    // lines so the chooser stays open for more kills.
+                                                    if let Some(model) = tree_vis_map.get(tree_selected).copied() {
+                                                        let kinds = tree_row_kinds(&tree_all);
+                                                        let mut end = model + 1;
+                                                        while end < kinds.len()
+                                                            && crate::choose_tree::depth(kinds[end])
+                                                                > crate::choose_tree::depth(kinds[model])
+                                                        {
+                                                            end += 1;
+                                                        }
+                                                        tree_all.drain(model..end);
+                                                        let shift = end - model;
+                                                        tree_collapsed = tree_collapsed
+                                                            .iter()
+                                                            .filter_map(|&i| {
+                                                                if i >= end { Some(i - shift) }
+                                                                else if i >= model { None }
+                                                                else { Some(i) }
+                                                            })
+                                                            .collect();
+                                                        let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
+                                                        tree_entries = rows;
+                                                        tree_vis_map = map;
+                                                    }
+                                                    if tree_selected >= tree_entries.len() && tree_selected > 0 {
+                                                        tree_selected -= 1;
+                                                    }
+                                                    if tree_entries.is_empty() {
+                                                        tree_chooser = false;
+                                                    }
+                                                }
+                                            }
+                                        } else if session_chooser {
+                                            // Kill the selected session (like tmux session chooser)
+                                            let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                                .get(session_selected)
+                                                .copied();
+                                            // The cursor has to be on the row the question
+                                            // named, which the wheel could have moved it off.
+                                            let selected = selected_entry
+                                                .and_then(|i| session_entries.get(i))
+                                                .map(|(sname, _)| sname.clone())
+                                                .filter(|sname| *sname == asked.session);
+                                            if let Some(sname) = selected {
+                                                if sname == current_session {
+                                                    // Killing the current session, so exit after the kill
+                                                    cmd_batch.push("kill-session\n".into());
+                                                    session_chooser = false;
+                                                    quit = true;
+                                                } else {
+                                                    // Kill another session by connecting to it
+                                                    let port_path = crate::paths::port_file(&sname);
+                                                    let key_path = crate::paths::key_file(&sname);
+                                                    if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+                                                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                                                            let addr = format!("127.0.0.1:{}", port);
+                                                            let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
+                                                            if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
+                                                                &addr.parse().unwrap(), Duration::from_millis(100)
+                                                            ) {
+                                                                let _ = write!(ss, "AUTH {}\n", sess_key.trim());
+                                                                let _ = ss.write_all(b"kill-session\n");
+                                                            }
+                                                        }
+                                                    }
+                                                    // Remove the killed session from the list
+                                                    if let Some(idx) = selected_entry {
+                                                        session_entries.remove(idx);
+                                                    }
+                                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                                    if session_selected >= visible_len && session_selected > 0 {
+                                                        session_selected -= 1;
+                                                    }
+                                                    if session_entries.is_empty() {
+                                                        session_chooser = false;
+                                                    }
+                                                    // Indexes shifted; drop any pending jump buffer.
+                                                    session_num_buffer.clear();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // `q` or `C-g`: the mode exits, as Escape does.
+                                _ if chooser_exit => {
+                                    tree_chooser = false;
+                                    session_chooser = false;
+                                    session_filter_active = false;
+                                    session_filter.clear();
+                                    session_num_buffer.clear();
+                                    buffer_chooser = false;
+                                    buffer_num_buffer.clear();
+                                    selection_changed = true;
+                                }
                                 KeyCode::Up if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
                                 KeyCode::Down if session_chooser => {
                                     let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
@@ -5092,10 +5567,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('G') if session_chooser => {
                                     session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
                                 }
-                                KeyCode::PageUp if session_chooser => { session_selected = session_selected.saturating_sub(10); }
+                                KeyCode::PageUp if session_chooser => { session_selected = crate::choose_tree::page_up(session_selected, session_page_h); }
                                 KeyCode::PageDown if session_chooser => {
-                                    let last = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
-                                    session_selected = (session_selected + 10).min(last);
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    session_selected = crate::choose_tree::page_down(session_selected, visible_len, session_page_h);
                                 }
                                 KeyCode::Home if session_chooser => { session_selected = 0; }
                                 KeyCode::End if session_chooser => {
@@ -5131,48 +5606,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Backspace if session_chooser => {
                                     session_num_buffer.pop();
                                 }
+                                // The same question for the session chooser, where tmux asks
+                                // `"Kill session %s? "` (`window-tree.c:1290`).
                                 KeyCode::Char('x') if session_chooser => {
-                                    // Kill the selected session (like tmux session chooser)
-                                    let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                    let sname = session_filtered_indices(&session_entries, &session_filter)
                                         .get(session_selected)
-                                        .copied();
-                                    if let Some((sname, _)) = selected_entry.and_then(|i| session_entries.get(i)) {
-                                        let sname = sname.clone();
-                                        if sname == current_session {
-                                            // Killing current session — exit after kill
-                                            cmd_batch.push("kill-session\n".into());
-                                            session_chooser = false;
-                                            quit = true;
-                                        } else {
-                                            // Kill another session by connecting to it
-                                            let port_path = crate::paths::port_file(&sname);
-                                            let key_path = crate::paths::key_file(&sname);
-                                            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                                                if let Ok(port) = port_str.trim().parse::<u16>() {
-                                                    let addr = format!("127.0.0.1:{}", port);
-                                                    let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
-                                                    if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                        &addr.parse().unwrap(), Duration::from_millis(100)
-                                                    ) {
-                                                        let _ = write!(ss, "AUTH {}\n", sess_key.trim());
-                                                        let _ = ss.write_all(b"kill-session\n");
-                                                    }
-                                                }
-                                            }
-                                            // Remove the killed session from the list
-                                            if let Some(idx) = selected_entry {
-                                                session_entries.remove(idx);
-                                            }
-                                            let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
-                                            if session_selected >= visible_len && session_selected > 0 {
-                                                session_selected -= 1;
-                                            }
-                                            if session_entries.is_empty() {
-                                                session_chooser = false;
-                                            }
-                                            // Indexes shifted; drop any pending jump buffer.
-                                            session_num_buffer.clear();
-                                        }
+                                        .copied()
+                                        .and_then(|i| session_entries.get(i))
+                                        .map(|(sname, _)| sname.clone());
+                                    if let Some(sname) = sname {
+                                        chooser_kill = Some(ChooserKill {
+                                            prompt: chooser_kill_session_prompt(&current_session, &sname),
+                                            window: None,
+                                            session: sname,
+                                        });
                                     }
                                 }
                                 KeyCode::Char('f') if session_chooser => {
@@ -5200,8 +5647,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // KEYC_LEFT and KEYC_RIGHT arms of tmux's mode_tree_key.
                                 // Left on an already collapsed row climbs to the parent and
                                 // collapses that; Right on an expanded row just steps down.
-                                // h/j/k/l stay plain cursor movement (issue #259), which is
-                                // what tmux itself does whenever line->flat holds.
+                                // `h`/`-` and `l`/`+` arrive here too, rewritten by
+                                // choose_tree::mode_tree_alias above, because tmux puts them
+                                // in the same arms (mode-tree.c:1390-1412, discussion #776).
                                 KeyCode::Left if tree_chooser => {
                                     let kinds = tree_row_kinds(&tree_all);
                                     let model = tree_vis_map.get(tree_selected).copied();
@@ -5232,16 +5680,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
-                                // hjkl parity with tmux mode-tree (issue #259): h/k = up, j/l = down
-                                // for flat lists. g/G map to Home/End.
+                                // k/j move (issue #259); h/l are the Left/Right arms above.
+                                // g/G map to Home/End.
                                 KeyCode::Char('k') if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Char('j') if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
-                                KeyCode::Char('h') if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
-                                KeyCode::Char('l') if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Char('g') if tree_chooser => { tree_selected = 0; }
                                 KeyCode::Char('G') if tree_chooser => { tree_selected = tree_entries.len().saturating_sub(1); }
-                                KeyCode::PageUp if tree_chooser => { tree_selected = tree_selected.saturating_sub(10); }
-                                KeyCode::PageDown if tree_chooser => { tree_selected = (tree_selected + 10).min(tree_entries.len().saturating_sub(1)); }
+                                KeyCode::PageUp if tree_chooser => { tree_selected = crate::choose_tree::page_up(tree_selected, tree_page_h); }
+                                KeyCode::PageDown if tree_chooser => { tree_selected = crate::choose_tree::page_down(tree_selected, tree_entries.len(), tree_page_h); }
                                 KeyCode::Home if tree_chooser => { tree_selected = 0; }
                                 KeyCode::End if tree_chooser => { tree_selected = tree_entries.len().saturating_sub(1); }
                                 KeyCode::Enter if tree_chooser => {
@@ -5268,7 +5714,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             }
                                             tree_chooser = false;
                                         } else if *sess_name != current_session {
-                                            // Window/pane in another session: switch to that session
+                                            // Window/pane in another session: make the row the
+                                            // current window (and pane) of that session, then
+                                            // switch to it. tmux runs `switch-client -t` with
+                                            // the row's own target (window_tree_get_target),
+                                            // so the client lands on the window that was
+                                            // chosen, not on whatever that session had active.
+                                            let focus = if *is_win {
+                                                format!("focus-window {}\n", wid)
+                                            } else {
+                                                format!("focus-pane {}\n", pid)
+                                            };
+                                            chooser_focus_in_session(sess_name, &focus);
                                             cmd_batch.push("client-detach\n".into());
                                             env::set_var("PSMUX_SWITCH_TO", sess_name);
                                             quit = true;
@@ -5291,52 +5748,23 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('p') if tree_chooser => {
                                     preview_enabled = !preview_enabled;
                                 }
-                                // 'x' kills the highlighted window (mirrors the session
-                                // chooser's `x` and tmux's window_tree_key 'x'). Scoped to a
-                                // window row in the current session: focus the window, then
-                                // kill it.
+                                // 'x' asks before it kills the highlighted window, which is what
+                                // tmux does (`window-tree.c:1282-1310`) and what psmux itself does
+                                // for the same act from `prefix &` (`src/help.rs:35`). Scoped to a
+                                // window row in the current session, as before. The kill runs from
+                                // the answer arm above.
                                 KeyCode::Char('x') if tree_chooser => {
-                                    // Copy out the fields we need so the immutable borrow
-                                    // ends before we mutate the model below.
-                                    if let Some((is_win, wid, sess_name)) = tree_entries
+                                    if let Some((is_win, wid, label, sess_name)) = tree_entries
                                         .get(tree_selected)
-                                        .map(|(iw, w, _p, _l, s)| (*iw, *w, s.clone()))
+                                        .map(|(iw, w, _p, l, s)| (*iw, *w, l.clone(), s.clone()))
                                     {
                                         if is_win && wid != usize::MAX && sess_name == current_session {
-                                            cmd_batch.push(format!("focus-window {}\n", wid));
-                                            cmd_batch.push("kill-window\n".into());
-                                            // Drop the killed window and the panes underneath
-                                            // it from the model, then rebuild the visible
-                                            // lines so the chooser stays open for more kills.
-                                            if let Some(model) = tree_vis_map.get(tree_selected).copied() {
-                                                let kinds = tree_row_kinds(&tree_all);
-                                                let mut end = model + 1;
-                                                while end < kinds.len()
-                                                    && crate::choose_tree::depth(kinds[end])
-                                                        > crate::choose_tree::depth(kinds[model])
-                                                {
-                                                    end += 1;
-                                                }
-                                                tree_all.drain(model..end);
-                                                let shift = end - model;
-                                                tree_collapsed = tree_collapsed
-                                                    .iter()
-                                                    .filter_map(|&i| {
-                                                        if i >= end { Some(i - shift) }
-                                                        else if i >= model { None }
-                                                        else { Some(i) }
-                                                    })
-                                                    .collect();
-                                                let (rows, map) = tree_rebuild_visible(&tree_all, &tree_collapsed);
-                                                tree_entries = rows;
-                                                tree_vis_map = map;
-                                            }
-                                            if tree_selected >= tree_entries.len() && tree_selected > 0 {
-                                                tree_selected -= 1;
-                                            }
-                                            if tree_entries.is_empty() {
-                                                tree_chooser = false;
-                                            }
+                                            chooser_kill = Some(ChooserKill {
+                                                prompt: format!(
+                                                    "kill-window {}", chooser_kill_target(&label)),
+                                                window: Some(wid),
+                                                session: sess_name,
+                                            });
                                         }
                                     }
                                 }
@@ -5357,8 +5785,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('l') if buffer_chooser => { if buffer_selected + 1 < buffer_entries.len() { buffer_selected += 1; } }
                                 KeyCode::Char('g') if buffer_chooser => { buffer_selected = 0; }
                                 KeyCode::Char('G') if buffer_chooser => { buffer_selected = buffer_entries.len().saturating_sub(1); }
-                                KeyCode::PageUp if buffer_chooser => { buffer_selected = buffer_selected.saturating_sub(10); }
-                                KeyCode::PageDown if buffer_chooser => { buffer_selected = (buffer_selected + 10).min(buffer_entries.len().saturating_sub(1)); }
+                                KeyCode::PageUp if buffer_chooser => { buffer_selected = crate::choose_tree::page_up(buffer_selected, buffer_page_h); }
+                                KeyCode::PageDown if buffer_chooser => { buffer_selected = crate::choose_tree::page_down(buffer_selected, buffer_entries.len(), buffer_page_h); }
                                 KeyCode::Home if buffer_chooser => { buffer_selected = 0; }
                                 KeyCode::End if buffer_chooser => { buffer_selected = buffer_entries.len().saturating_sub(1); }
                                 KeyCode::Enter if buffer_chooser => {
@@ -5469,7 +5897,32 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // other character fall through to the pane, so a
                                 // letter typed or pasted here reached the shell.
                                 KeyCode::Char(c) if window_idx_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { window_idx_buf.push(c); paste_gesture.record_char(c); }
-                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); paste_gesture.record_char(c); }
+                                // Text goes in at the cursor, through the same
+                                // helper the rename overlay uses. AltGr is the
+                                // exception to the CONTROL guard: Windows reports
+                                // it as Ctrl+Alt, so `@` on a German layout
+                                // arrives as Ctrl+Alt+@ and is text. It used to
+                                // fail this guard and reach the AltGr arm below,
+                                // which hands the character to the PANE, so the
+                                // character never arrived in the prompt at all.
+                                KeyCode::Char(c) if command_input
+                                    && (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || is_altgr_char(c, key.modifiers))
+                                    && !paste_burst_active => {
+                                    let mut buf = [0u8; 4];
+                                    crate::copy_mode::prompt_insert(&mut command_buf, command_back, c.encode_utf8(&mut buf));
+                                    paste_gesture.record_char(c);
+                                }
+                                // A character inside the paste suppress window is
+                                // the host's duplicate of a paste the prompt has
+                                // already taken (#290), so it is dropped here. The
+                                // catch all arm below would hand it to the prompt
+                                // editor, which types a Space as a space: pasting
+                                // "a b c d" left "a b c d   " in the line.
+                                KeyCode::Char(c) if command_input
+                                    && paste_burst_active
+                                    && (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || is_altgr_char(c, key.modifiers)) => {}
                                 // The copy-mode prompt editor, as it stands,
                                 // reused here: tmux reaches this overlay
                                 // through `command-prompt`, which has the full
@@ -5496,15 +5949,6 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
                                 KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
-                                KeyCode::Backspace if command_input => {
-                                    if command_cursor > 0 {
-                                        // Walk back to the previous char boundary so we never split a UTF-8 sequence.
-                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
-                                        let new_cursor = command_cursor - prev_len;
-                                        command_buf.replace_range(new_cursor..command_cursor, "");
-                                        command_cursor = new_cursor;
-                                    }
-                                }
                                 KeyCode::Enter if renaming => {
                                     if session_renaming {
                                         cmd_batch.push(format!("rename-session {}\n", quote_arg(&rename_buf)));
@@ -5618,65 +6062,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         }
                                     }
                                     command_input = false;
-                                    command_cursor = 0;
+                                    command_back = 0;
                                     command_template = None;
                                     command_prompt_label = None;
                                 }
                                 KeyCode::Esc if renaming => { renaming = false; session_renaming = false; }
                                 KeyCode::Esc if pane_renaming => { pane_renaming = false; }
                                 KeyCode::Esc if window_idx_input => { window_idx_input = false; }
-                                KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; command_template = None; command_prompt_label = None; }
+                                KeyCode::Esc if command_input => { command_input = false; command_back = 0; command_template = None; command_prompt_label = None; }
 
-                                // Command prompt: cursor movement, history, and editing keys
-                                KeyCode::Left if command_input => {
-                                    if command_cursor > 0 {
-                                        let prev_len = command_buf[..command_cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
-                                        command_cursor -= prev_len;
-                                    }
-                                }
-                                KeyCode::Right if command_input => {
-                                    if command_cursor < command_buf.len() {
-                                        let next_len = command_buf[command_cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                                        command_cursor += next_len;
-                                    }
-                                }
-                                KeyCode::Home if command_input => { command_cursor = 0; }
-                                KeyCode::End if command_input => { command_cursor = command_buf.len(); }
-                                KeyCode::Delete if command_input => { if command_cursor < command_buf.len() { command_buf.remove(command_cursor); } }
-                                KeyCode::Up if command_input => {
-                                    if command_history_idx > 0 {
-                                        command_history_idx -= 1;
-                                        command_buf = command_history[command_history_idx].clone();
-                                        command_cursor = command_buf.len();
-                                    }
-                                }
-                                KeyCode::Down if command_input => {
-                                    if command_history_idx < command_history.len() {
-                                        command_history_idx += 1;
-                                        command_buf = if command_history_idx < command_history.len() {
-                                            command_history[command_history_idx].clone()
-                                        } else {
-                                            String::new()
-                                        };
-                                        command_cursor = command_buf.len();
-                                    }
-                                }
-                                KeyCode::Char('a') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => { command_cursor = 0; }
-                                KeyCode::Char('e') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => { command_cursor = command_buf.len(); }
-                                KeyCode::Char('u') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    command_buf.drain(..command_cursor);
-                                    command_cursor = 0;
-                                }
-                                KeyCode::Char('k') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    command_buf.truncate(command_cursor);
-                                }
-                                KeyCode::Char('w') if command_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let mut pos = command_cursor;
-                                    while pos > 0 && command_buf.as_bytes().get(pos - 1) == Some(&b' ') { pos -= 1; }
-                                    while pos > 0 && command_buf.as_bytes().get(pos - 1) != Some(&b' ') { pos -= 1; }
-                                    command_buf.drain(pos..command_cursor);
-                                    command_cursor = pos;
-                                }
                                 // Every key the rename overlay has no use for
                                 // stops here. Up, Down, Tab, PageUp, F keys and
                                 // the rest used to fall through to the arms
@@ -5685,6 +6079,61 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // before the overlay had an editor. tmux's
                                 // prompt keeps every key it is given.
                                 _ if renaming => {}
+
+                                // Every other key at the command prompt goes to
+                                // the shared prompt editor, the one the rename
+                                // overlay and the copy mode prompts already use,
+                                // and stops here whether the editor had a use for
+                                // it or not. tmux's prompt does the same: its own
+                                // `default` case appends the key to the buffer
+                                // (`status.c:1704`), so no key pressed at a prompt
+                                // reaches a pane. These used to fall through to
+                                // the arms below, where a Ctrl plus letter becomes
+                                // `send-key C-<letter>` for the focused pane:
+                                // `C-l` cleared the shell's screen behind the
+                                // prompt and `C-p` recalled the shell's own
+                                // history (discussion #782).
+                                _ if command_input => {
+                                    match command_prompt_key(
+                                        &mut command_buf,
+                                        &mut command_back,
+                                        effective_code,
+                                        key.modifiers,
+                                    ) {
+                                        PromptKeyAction::Close => {
+                                            command_input = false;
+                                            command_back = 0;
+                                            command_template = None;
+                                            command_prompt_label = None;
+                                            // Nothing else asks for a repaint
+                                            // here: on an idle pane no frame
+                                            // comes, and the closed overlay
+                                            // stayed drawn. Escape's branch and
+                                            // the rename overlay's cancel do the
+                                            // same.
+                                            selection_changed = true;
+                                        }
+                                        PromptKeyAction::HistoryUp => {
+                                            if command_history_idx > 0 {
+                                                command_history_idx -= 1;
+                                                command_buf = command_history[command_history_idx].clone();
+                                                command_back = 0;
+                                            }
+                                        }
+                                        PromptKeyAction::HistoryDown => {
+                                            if command_history_idx < command_history.len() {
+                                                command_history_idx += 1;
+                                                command_buf = if command_history_idx < command_history.len() {
+                                                    command_history[command_history_idx].clone()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                command_back = 0;
+                                            }
+                                        }
+                                        PromptKeyAction::Edited => {}
+                                    }
+                                }
 
                                 // The CONTROL guard is load bearing (issue #623).
                                 // `fold_nul_to_ctrl_space` has already rewritten a
@@ -5958,7 +6407,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // exactly as before.
                                 KeyCode::Backspace => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Backspace", key.modifiers))); }
                                 KeyCode::Delete => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Delete", key.modifiers))); }
-                                KeyCode::Esc => { cmd_batch.push("send-key esc\n".into()); }
+                                KeyCode::Esc => { cmd_batch.push(format!("send-key {}\n", escape_key_name(key.modifiers))); }
                                 KeyCode::Left => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Left", key.modifiers))); }
                                 KeyCode::Right => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Right", key.modifiers))); }
                                 KeyCode::Up => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Up", key.modifiers))); }
@@ -5979,7 +6428,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // prompt / rename prompts into the underlying pane.
                         let consumed = route_paste_to_overlay(
                             &data,
-                            command_input, &mut command_buf, &mut command_cursor,
+                            command_input, &mut command_buf, command_back,
                             renaming, &mut rename_buf,
                             pane_renaming, &mut pane_title_buf,
                             window_idx_input, &mut window_idx_buf,
@@ -6810,6 +7259,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     gesture_open: paste_gesture.is_open(),
                     clip_head: paste_clip_head.get(),
                     held_for: paste_pend_start.map(|s| s.elapsed()).unwrap_or_default(),
+                    shifted_head: paste_head_shifted,
                 }
             } else {
                 PasteHeadEvidence::default()
@@ -6858,8 +7308,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     // with two falses after it read as a contradiction (#684).
                     let gesture = evidence.gesture_open;
                     let prefix = evidence.clipboard_starts_with(&paste_pend);
-                    let why = if gesture || prefix {
-                        format!("head of a paste (ctrl-v gesture={}, clipboard prefix={})", gesture, prefix)
+                    let shifted = evidence.shifted_head && paste_pend.chars().count() == 1;
+                    let why = if gesture || prefix || shifted {
+                        format!("head of a paste (ctrl-v gesture={}, clipboard prefix={}, shifted head={})", gesture, prefix, shifted)
                     } else {
                         "newline or tab never takes the zero latency path".to_string()
                     };
@@ -6889,7 +7340,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // behind the prompt.
                 let consumed = route_paste_to_overlay(
                     &paste_pend,
-                    command_input, &mut command_buf, &mut command_cursor,
+                    command_input, &mut command_buf, command_back,
                     renaming, &mut rename_buf,
                     pane_renaming, &mut pane_title_buf,
                     window_idx_input, &mut window_idx_buf,
@@ -6939,7 +7390,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             // at all.
                             let consumed = route_paste_to_overlay(
                                 &text,
-                                command_input, &mut command_buf, &mut command_cursor,
+                                command_input, &mut command_buf, command_back,
                                 renaming, &mut rename_buf,
                                 pane_renaming, &mut pane_title_buf,
                                 window_idx_input, &mut window_idx_buf,
@@ -7066,6 +7517,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
         let overlays_active = command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
+        // An overlay that closes without the server changing anything (n at
+        // `kill-pane? (y/n)`, Escape out of a prompt) leaves no new frame to
+        // draw, and the skip checks below used to `continue` on exactly that
+        // pass, so the closed box stayed painted on screen and read as a
+        // question still waiting for an answer (#767). The pass that sees the
+        // overlay go away renders once more to wipe it.
+        let overlay_closed = prev_overlays_active && !overlays_active;
+        prev_overlays_active = overlays_active;
         let should_dump = should_request_dump(force_dump, size_changed, typing_active, since_dump);
         // A failed request here is NOT the end of the client (issue #675).
         // The reader thread may have just noticed the same drop and started a
@@ -7101,13 +7560,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // ── STEP 3: Render if we have a frame ────────────────────────────
         // Also render if selection changed (for highlight overlay) even without new frame
         // Always render when overlays are active (command prompt, rename, choosers)
-        if !got_frame && !selection_changed && !overlays_active {
+        if !got_frame && !selection_changed && !overlays_active && !overlay_closed {
             continue;
         }
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
-        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active {
+        if dump_buf == prev_dump_buf && !selection_changed && !overlays_active && !overlay_closed {
             last_dump_time = Instant::now();
             continue;
         }
@@ -7313,6 +7772,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             synced_bindings = state.bindings;
         }
         defaults_suppressed = state.defaults_suppressed;
+        // A table the server set without this client (CLI, command prompt,
+        // run-shell, hook) becomes the client's latch for the next key.
+        key_table_sync.set_default(state.default_key_table.as_deref());
+        if let Some(adopt) = key_table_sync.on_server_table(state.key_table.as_deref()) {
+            key_table_latch = adopt;
+        }
         scroll_enter_copy_mode = state.scroll_enter_copy_mode;
         mouse_drag_enter_copy_mode = state.mouse_drag_enter_copy_mode;
         client_copy_ln = (
@@ -7641,6 +8106,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             } // !active_pane_in_copy_mode
             } // if let sel_s, sel_e
 
+            // Floating panes (tmux new-pane) are part of the window: they draw
+            // above the tiled layout and BELOW every chooser, prompt and
+            // overlay. They used to be drawn after the client's own overlays
+            // (choose-tree, rename, command prompt, confirm), so a float
+            // covering the middle of the window painted over the centred
+            // `kill-pane? (y/n)` box: prefix x drew nothing while the question
+            // still waited for the next key (#767). tmux draws its prompts and
+            // overlays on top of panes, floating ones included.
+            if !srv_floats.is_empty() {
+                render_float_overlays(
+                    f,
+                    content_chunk,
+                    &srv_floats,
+                    window_styles,
+                    pane_border_style,
+                    pane_active_border_style,
+                    border_indicators,
+                );
+            }
             if session_chooser {
                 let sel_style = crate::style::parse_tmux_style(&mode_style_str);
                 let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
@@ -7711,6 +8195,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // Reserve rows for the active jump and filter indicators.
                 let reserved = buffer_rows as usize;
                 let visible_h = (list_area.height as usize).saturating_sub(reserved);
+                session_page_h = visible_h;
                 if visible_h > 0 && session_selected >= session_scroll + visible_h {
                     session_scroll = session_selected.saturating_sub(visible_h - 1);
                 }
@@ -7921,6 +8406,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 } else { None };
 
                 let visible_h = (list_area.height as usize).saturating_sub(buffer_rows as usize);
+                tree_page_h = visible_h;
                 if visible_h > 0 && tree_selected >= tree_scroll + visible_h {
                     tree_scroll = tree_selected.saturating_sub(visible_h - 1);
                 }
@@ -8071,6 +8557,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
                 let visible_h = (inner.height as usize).saturating_sub(buffer_rows as usize);
+                buffer_page_h = visible_h;
                 if visible_h > 0 && buffer_selected >= buffer_scroll + visible_h {
                     buffer_scroll = buffer_selected.saturating_sub(visible_h - 1);
                 }
@@ -8557,9 +9044,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
+                // `command_back` counts characters from the end, the way the
+                // shared prompt editor does; the window wants a byte offset, and
+                // the same walk the rename overlay does turns one into the other.
+                let mut at = command_buf.len();
+                for ch in command_buf.chars().rev().take(command_back.min(command_buf.chars().count())) {
+                    at -= ch.len_utf8();
+                }
                 // The cursor column is the display WIDTH of the text before
-                // it, not its byte offset: command_cursor counts bytes
-                // (c.len_utf8() above), and eight box drawing characters are
+                // it, not its byte offset: eight box drawing characters are
                 // 24 bytes over 8 columns, so adding the offset to a column
                 // drew the cursor 16 past the text and eventually outside the
                 // border (#741). The window scrolls with the cursor as tmux's
@@ -8567,7 +9060,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // being typed on screen instead of clipping it.
                 let avail = inner.width.saturating_sub(2) as usize; // after ": "
                 let (shown, cur_col) =
-                    crate::util::prompt_window(&command_buf, command_cursor, avail);
+                    crate::util::prompt_window(&command_buf, at, avail);
                 let para = Paragraph::new(format!(": {}", shown));
                 f.render_widget(para, inner);
                 let cx = inner.x + 2 + cur_col as u16;
@@ -8586,7 +9079,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.set_cursor_position((cx, inner.y));
                 prompt_cursor_pos = Some((cx, inner.y));
             }
-            if let Some(ref cmd) = confirm_cmd {
+            // `confirm_cmd` is the prompt a binding put up, `chooser_kill` the
+            // one a chooser's `x` put up over its own list. They share the
+            // box so the question reads the same wherever it came from, and
+            // only one of the two can be up: the prefix table is out of reach
+            // while a chooser is open.
+            if let Some(cmd) = confirm_cmd
+                .as_deref()
+                .or(chooser_kill.as_ref().map(|k| k.prompt.as_str()))
+            {
                 let overlay = Block::default().borders(Borders::ALL).title("confirm");
                 let oa = centered_rect(50, 3, content_chunk);
                 f.render_widget(Clear, oa);
@@ -8596,19 +9097,6 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
 
             // ── Server-side overlay rendering ────────────────────────
-            // Floating panes (tmux new-pane) draw above the tiled layout but
-            // below modal popups so a popup still stacks on top.
-            if !srv_floats.is_empty() {
-                render_float_overlays(
-                    f,
-                    content_chunk,
-                    &srv_floats,
-                    window_styles,
-                    pane_border_style,
-                    pane_active_border_style,
-                    border_indicators,
-                );
-            }
             if srv_popup_active {
                 let popup_area = popup_overlay_rect(content_chunk, srv_popup_width, srv_popup_height);
                 let w = popup_area.width;
@@ -8913,6 +9401,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // as the status message plus the offset of its cursor, and
                 // the draw above turned that into a position.
                 prompt_cursor_pos
+            } else if tree_chooser || session_chooser || buffer_chooser {
+                // A chooser is a mode over the pane, and tmux turns the
+                // cursor off for every mode tree mode when it starts
+                // (`(*s)->mode &= ~MODE_CURSOR;`, mode-tree.c:536 in 3.7b).
+                // The pane's cursor used to stay lit under the list
+                // (discussion #776).
+                None
+            } else if let Some(float_cursor) = focused_float_cursor(content_chunk, &srv_floats) {
+                // A focused floating pane is the active pane, so the cursor
+                // goes inside it (#767). It used to fall through to the tiled
+                // pane's cursor, leaving it blinking at the prompt behind the
+                // float while every keystroke went into the float.
+                float_cursor
             } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
                 // Content lives inside the border-label reservation; use the render's inner rect.
                 let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
@@ -8935,6 +9436,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 && !window_idx_input
                 && !status_prompt_open
                 && !renaming
+                && !srv_floats.iter().any(|fl| fl.focused)
             {
                 if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
                     let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
@@ -9239,6 +9741,16 @@ struct PasteHeadEvidence<'a> {
     clip_head: Option<&'a str>,
     /// How long the pending buffer has been held so far.
     held_for: Duration,
+    /// The first pending character came with Shift and nothing else.
+    ///
+    /// The console host turns VT text written to its input into key records,
+    /// and a character that needs Shift (a capital, `(`, `"`) is handed over
+    /// as Shift down, key, Shift up in a write of its own, ahead of the rest
+    /// of the text. When that character opens a paste the client drains it
+    /// alone, and the rest arrives about a millisecond later (issue #766:
+    /// `Y` reached the pane in front of `ESC[200~`, 6 of 6 runs for a shifted
+    /// first character, 0 of 6 for an unshifted one).
+    shifted_head: bool,
 }
 
 /// How long a lone character that matches the clipboard's first character is
@@ -9284,6 +9796,22 @@ fn stage2_paste_is_over(held_for: Duration, since_last_char: Duration) -> bool {
     held_for > Duration::from_millis(300) && since_last_char >= PASTE_STAGE2_QUIET
 }
 
+/// A key arriving while stage 2 holds a paste ends that paste when the paste
+/// had already gone quiet for [`PASTE_STAGE2_QUIET`] (issue #766).
+///
+/// The quiet rule is the one [`stage2_paste_is_over`] uses, applied when the
+/// next key arrives instead of only when the 300 ms window runs out: a gap
+/// that long means the paste was complete, so the key is new input and goes
+/// to the pane AFTER the paste's closing `ESC[201~`. tmux gets this for free,
+/// because its host brackets the paste in the byte stream and the key after
+/// `ESC[201~` is parsed as a key (tty-keys.c `tty_keys_paste`). Fragments
+/// of one paste that sshd's ConPTY hands over 20 to 60 ms apart (#598) stay
+/// below the threshold and keep accumulating as before.
+#[cfg(windows)]
+fn stage2_paste_ended_by_new_key(paste_stage2: bool, pend_non_empty: bool, since_last_char: Duration) -> bool {
+    paste_stage2 && pend_non_empty && since_last_char >= PASTE_STAGE2_QUIET
+}
+
 #[cfg(windows)]
 impl<'a> PasteHeadEvidence<'a> {
     /// True when `pend` could be the start of the clipboard's text.
@@ -9300,6 +9828,15 @@ impl<'a> PasteHeadEvidence<'a> {
 
     fn head_of_paste(&self, pend: &str) -> bool {
         if self.gesture_open {
+            return true;
+        }
+        // A lone shifted character is held for the same short window as a
+        // clipboard prefix: the rest of a paste follows it inside a
+        // millisecond, a typed character has no follow up that fast.
+        if self.shifted_head
+            && pend.chars().count() == 1
+            && self.held_for < PASTE_HEAD_PREFIX_HOLD
+        {
             return true;
         }
         if !self.clipboard_starts_with(pend) {
@@ -9359,11 +9896,37 @@ impl ClipboardHeadCache {
     const HEAD_CHARS: usize = 64;
 
     fn get(&mut self) -> Option<&str> {
-        let seq = crate::clipboard::clipboard_sequence_number();
+        self.get_with(
+            crate::clipboard::clipboard_sequence_number(),
+            crate::clipboard::try_read_from_system_clipboard,
+        )
+    }
+
+    /// A read that could not open the clipboard is not cached: another
+    /// window (a clipboard history listener, a paste in flight) holding it
+    /// open for a moment would otherwise blank the head until the clipboard
+    /// next changed, and every later paste of the same text would be flushed
+    /// as typing, one character at a time (issue #684).
+    fn get_with(
+        &mut self,
+        seq: u32,
+        read: impl FnOnce() -> Result<Option<String>, crate::clipboard::ClipboardBusy>,
+    ) -> Option<&str> {
         if self.seq != Some(seq) {
-            self.seq = Some(seq);
-            self.head = read_from_system_clipboard()
-                .map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+            match read() {
+                Ok(text) => {
+                    self.seq = Some(seq);
+                    self.head = text.map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+                }
+                Err(_) => {
+                    if input_log_enabled() {
+                        input_log("paste", &format!(
+                            "clipboard busy (seq {}), head not cached", seq));
+                    }
+                    self.seq = None;
+                    self.head = None;
+                }
+            }
         }
         self.head.as_deref()
     }
@@ -9575,6 +10138,47 @@ pub(crate) fn is_altgr_char(c: char, mods: KeyModifiers) -> bool {
         && !c.is_ascii_lowercase()
 }
 
+/// What a key typed at the client's command prompt asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptKeyAction {
+    /// C-c, C-g or C-[: cancel the prompt, as Escape does.
+    Close,
+    /// Up or C-p: the caller recalls an older entry from the history.
+    HistoryUp,
+    /// Down or C-n: a newer one.
+    HistoryDown,
+    /// The editor took the key, or had no use for it. Either way it stops at
+    /// the prompt.
+    Edited,
+}
+
+/// One key at the client's command prompt, other than text, Enter and Escape.
+///
+/// The editing itself is `copy_mode::prompt_edit`, the editor the copy mode
+/// prompts and the rename overlay already share, reached by the tmux name of
+/// the key. C-c and C-g cancel tmux's prompt the way Escape does
+/// (`status.c:1671` to `:1674`) and C-[ IS Escape.
+pub(crate) fn command_prompt_key(
+    buf: &mut String,
+    back: &mut usize,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> PromptKeyAction {
+    if let KeyCode::Char(c) = code {
+        if mods.contains(KeyModifiers::CONTROL)
+            && matches!(c.to_ascii_lowercase(), 'c' | 'g' | '[')
+        {
+            return PromptKeyAction::Close;
+        }
+    }
+    let name = crate::config::format_key_binding(&(code, mods));
+    match crate::copy_mode::prompt_edit(buf, back, &name) {
+        crate::copy_mode::PromptEdit::HistoryUp => PromptKeyAction::HistoryUp,
+        crate::copy_mode::PromptEdit::HistoryDown => PromptKeyAction::HistoryDown,
+        _ => PromptKeyAction::Edited,
+    }
+}
+
 /// A Ctrl+letter typed into the rename overlay. Returns true when the key
 /// closes the overlay: C-c and C-g cancel tmux's prompt (prompt.c, beside
 /// Escape) and C-[ is Escape itself. Anything else goes to the copy-mode prompt
@@ -9631,7 +10235,7 @@ fn route_paste_to_overlay(
     data: &str,
     command_input: bool,
     command_buf: &mut String,
-    command_cursor: &mut usize,
+    command_back: usize,
     renaming: bool,
     rename_buf: &mut String,
     pane_renaming: bool,
@@ -9640,8 +10244,7 @@ fn route_paste_to_overlay(
     window_idx_buf: &mut String,
 ) -> bool {
     if command_input {
-        command_buf.insert_str(*command_cursor, data);
-        *command_cursor += data.len();
+        crate::copy_mode::prompt_insert(command_buf, command_back, data);
         true
     } else if renaming {
         rename_buf.push_str(data);
@@ -9671,8 +10274,20 @@ mod tests;
 mod test_zoom_bleed;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_chooser_kill_confirm.rs"]
+mod test_chooser_kill_confirm;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue744_paste_overlay_routing.rs"]
 mod test_issue744_paste_overlay_routing;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue684_clipboard_head_cache.rs"]
+mod test_issue684_clipboard_head_cache;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue766_paste_then_key.rs"]
+mod test_issue766_paste_then_key;
 
 /// How long the client keeps polling console input at 1ms after sending a key,
 /// waiting for that key's echo to come back and be drawn.
@@ -9867,3 +10482,11 @@ mod test_issue658_idle_dump_floor;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue675_stale_writer.rs"]
 mod test_issue675_stale_writer;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_keytable_switch_client.rs"]
+mod test_keytable_switch_client;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue783_prompt_edit_unify.rs"]
+mod test_issue783_prompt_edit_unify;

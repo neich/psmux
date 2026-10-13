@@ -182,7 +182,16 @@ param(
     # above the measured envelope and still half of anything pathological; the
     # real per creation accounting is tests/test_pane_startup_perf.ps1, which
     # writes cold_creation_ratio against the bare shell for the trend.
-    [int]$MaxLimitMs = 2000,
+    #
+    # 2026-10-08: the envelope moved again and 2000 now sits inside it. The
+    # draining creation of the back to back new-window run (the 3rd at depth
+    # two, the 4th at depth three since 1e5c2021; every other creation 13 to
+    # 30 ms) measured 1409 to 2279 ms in 15 runs at depth two on 10-07 and 1634
+    # to 2113 ms in 12 runs at depth three on 10-08, failing two sweeps out of
+    # three on max alone with p50 at 15 ms. Serialising the spawns cut it to
+    # 750 ms but made the typical creation 150 ms (9054da96, reverted
+    # 51aea044), so the floor stays and the backstop moves above it.
+    [int]$MaxLimitMs = 2500,
     [int]$PollMs = 10,
     # The resource cell: how many windows and splits are stacked up before the
     # second memory sample is taken, and how long the quiet windows are.
@@ -268,7 +277,7 @@ if ($imgName -notin @("psmux", "pmux", "tmux")) {
 Write-Info "Using: $Binary"
 
 $DataDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR.TrimEnd('\', '/') } else { "$env:USERPROFILE\.psmux" }
-if (-not $MetricsDir) { $MetricsDir = "$env:USERPROFILE\.psmux-test-data\metrics" }
+$MetricsDir = Get-PerfMetricsDir $MetricsDir
 # Routing env vars would retarget every command at whatever session happens to
 # host the shell this suite was started from.
 $env:PSMUX_SESSION_NAME = $null

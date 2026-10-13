@@ -25,6 +25,26 @@ pub(crate) fn collect_pane_paths_server(
     }
 }
 
+/// The session's default key table: tmux `server_client_get_key_table`, the
+/// `key-table` session option, root when unset or empty. A client goes back to
+/// it after every key, and a key not bound in it is passed to the pane.
+pub(crate) fn default_key_table(app: &AppState) -> &str {
+    match app.user_options.get("key-table").map(|s| s.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => "root",
+    }
+}
+
+/// The default key table for the attached client's state frame, left out when
+/// it is root so frames stay the same size for everyone who never sets it.
+pub(crate) fn append_default_key_table_json(table: &str, buf: &mut String) {
+    if table == "root" || !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"default_key_table\":\"");
+    buf.push_str(&json_escape_string(table));
+    buf.push_str("\"}");
+}
+
 /// Resolve a `switch-client -T <table>` request against the live key tables.
 ///
 /// Issue #640. tmux's `cmd_switch_client_exec` calls
@@ -42,8 +62,15 @@ pub(crate) fn resolve_switch_client_table(
     app: &AppState,
     table: &str,
 ) -> Result<Option<String>, String> {
-    if table == "root" {
+    // `None` is the session's `key-table` (root unless set). Naming the
+    // default table is the same as dropping back to it, and root always
+    // exists, so with a non root default `-T root` latches root for one key.
+    let default = default_key_table(app);
+    if table == default {
         return Ok(None);
+    }
+    if table == "root" {
+        return Ok(Some("root".to_string()));
     }
     if table == "prefix" || app.key_tables.contains_key(table) {
         return Ok(Some(table.to_string()));
@@ -163,6 +190,24 @@ pub(crate) fn append_session_name_json(name: &str, buf: &mut String) {
     buf.pop();
     buf.push_str(",\"session_name\":\"");
     buf.push_str(&json_escape_string(name));
+    buf.push_str("\"}");
+}
+
+/// The key table a `switch-client -T` left the client in, for the attached
+/// client's state frame. Absent means the default (root) table.
+///
+/// The attached client does its own key dispatch, so a table the SERVER set
+/// (`switch-client -T` from the CLI, the command prompt, run-shell, a hook)
+/// never reached it: `#{client_key_table}` said `mytbl` while the next key was
+/// still looked up in root. tmux has one `c->keytable` that every one of those
+/// routes writes and the key handler reads (cmd-switch-client.c:96,
+/// server-client.c server_client_handle_key), so the client must learn it.
+pub(crate) fn append_key_table_json(table: Option<&str>, buf: &mut String) {
+    let Some(t) = table else { return };
+    if !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"key_table\":\"");
+    buf.push_str(&json_escape_string(t));
     buf.push_str("\"}");
 }
 
@@ -680,15 +725,24 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
 
 /// Ingest one staged pane OSC 52 payload: paste buffer plus client forward.
 ///
-/// tmux parity (input.c input_osc_52): a pane initiated OSC 52 is BOTH
-/// forwarded to the host terminal AND added to the paste buffer stack via
-/// paste_add, and tmux does this server side during input parsing whether or
-/// not a client is attached. The buffer add here is therefore unconditional.
+/// tmux (input.c input_osc_52_parse) accepts a pane initiated OSC 52 only on
+/// `set-clipboard on`: it then forwards it to the host terminal AND adds it
+/// to the paste buffer stack via paste_add, server side during input parsing,
+/// whether or not a client is attached. On `external` and `off` tmux drops
+/// the sequence entirely; `external` only lets tmux's own copies (copy mode,
+/// set-buffer -w) set the terminal clipboard.
+///
+/// psmux matches the buffer half (only `on` adds a buffer, #771) and keeps
+/// one deliberate difference: on `external`, the default, the payload is
+/// still forwarded, because that forward is how an application's clipboard
+/// write (nvim, an agent CLI) reaches the Windows clipboard through the
+/// attached client. `off` forwards nothing.
+///
 /// The one-shot `clipboard_osc52` forward slot is OVERWRITTEN with the
 /// newest payload: a clipboard collapse must keep the latest write, and in a
 /// detached session the slot would otherwise wedge on the first never
 /// delivered payload and serve stale content when a client finally attaches
-/// (every payload still lands in the buffer stack regardless).
+/// (on `on` every payload still lands in the buffer stack regardless).
 ///
 /// Called from the dump-state builders (attached clients, per frame) and
 /// from the main loop's 100ms housekeeping tick (detached sessions).
@@ -699,9 +753,17 @@ pub(crate) fn drain_osc52(app: &mut AppState) {
     let Some((_sel, b64)) = take_pane_clipboard(app) else { return };
     let Ok(b64_str) = std::str::from_utf8(&b64) else { return };
     let Some(text) = crate::util::base64_decode(b64_str) else { return };
-    app.paste_buffers.insert(0, text.clone());
-    if app.paste_buffers.len() > 10 {
-        app.paste_buffers.pop();
+    // `on` lets the application create a buffer; `external` only forwards.
+    // tmux's option says so in as many words, "whether to allow applications
+    // to create paste buffers with an escape sequence ('on' only)", and
+    // input_osc_52_parse returns before decoding unless the value is `on`
+    // (input.c, the `!= 2` guard). The forward below is not gated on `on`:
+    // see the doc comment for why psmux still forwards on `external`.
+    if app.set_clipboard == "on" {
+        app.paste_buffers.insert(0, text.clone());
+        if app.paste_buffers.len() > 10 {
+            app.paste_buffers.pop();
+        }
     }
     app.clipboard_osc52 = Some(text);
 }
