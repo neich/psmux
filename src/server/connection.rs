@@ -2005,10 +2005,18 @@ if line.trim() == "PERSISTENT" {
     }
 }
 
-// Check for CONTROL or CONTROL_NOECHO (control mode)
+// Check for CONTROL, CONTROL_QUIET or CONTROL_NOECHO (control mode).
+//
+// CONTROL is `-C` on a console: the client switched the console's own echo
+// off to read it raw, so the server writes each command line back in its
+// place, which is what a tty shows a `tmux -C` user. CONTROL_QUIET is `-C`
+// on a pipe or a pty that echoes for itself: tmux never echoes anything, and
+// a client reading the stream sees only protocol lines (issue #857).
+// CONTROL_NOECHO is `-CC`.
 let control_echo = line.trim() == "CONTROL";
+let control_quiet = line.trim() == "CONTROL_QUIET";
 let control_noecho = line.trim() == "CONTROL_NOECHO";
-if control_echo || control_noecho {
+if control_echo || control_quiet || control_noecho {
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
@@ -2138,17 +2146,17 @@ if control_echo || control_noecho {
     //   - flag=0 (server-originated) creates a synthetic currentCommand_
     //     and the matching %end fires tmuxInitialCommandDidCompleteSuccessfully
     //     which kicks off iTerm's tmux integration (phony-command, ping, etc.).
+    //
+    // `-C` gets the same block without the DCS: tmux answers the command
+    // line command first in every control mode, and a client that pairs
+    // replies with commands in order counts on it. psmux used to send a
+    // blank line here instead, so every later reply landed on the command
+    // before it (issue #857).
     {
         let mut ws = write_lock.lock().unwrap();
-        if control_noecho {
-            let init_ts = chrono::Utc::now().timestamp();
-            // DCS opener (no newline) immediately followed by %begin, sent
-            // as one write: the bytes are the same, only the send count drops.
-            let _ = write!(ws, "\x1bP1000p%begin {0} 1 0\n%end {0} 1 0\n", init_ts);
-        } else {
-            // -C (echo) mode: no DCS, just a blank ready line
-            let _ = writeln!(ws);
-        }
+        let init_ts = chrono::Utc::now().timestamp();
+        // One write: DCS opener (no newline) and the block together.
+        let _ = ws.write_all(control::initial_reply_block(init_ts, control_noecho).as_bytes());
         let _ = ws.flush();
     }
 
@@ -2167,7 +2175,9 @@ if control_echo || control_noecho {
     });
 
     // Control mode command loop: read lines, dispatch, wrap in %begin/%end/%error
-    let mut cmd_counter: u64 = 0;
+    // Number 1 is the initial block above; tmux numbers every command
+    // uniquely, so the first stdin command is 2, never a second 1.
+    let mut cmd_counter: u64 = 1;
     let tx_ctrl = tx.clone();
     let aliases_ctrl = aliases.clone();
     // Queue of pending sub-command strings produced by splitting a single input
@@ -2669,6 +2679,14 @@ if control_echo || control_noecho {
                 out.push_str(&footer);
                 out.push('\n');
                 failed = is_error;
+                // tmux tells the control client the session list changed once
+                // the command that created a session is done (notify.c
+                // session-created fires %sessions-changed after the %end).
+                // The new session lives on its own server, so this server's
+                // notification thread never sees it; the reply carries it.
+                if !is_error && matches!(cmd_name, "new-session" | "new") {
+                    out.push_str("%sessions-changed\n");
+                }
             }
             Some(Err(_)) => {
                 out.push_str("command timed out\n");
@@ -6261,9 +6279,13 @@ match cmd {
 
             // The session belongs to this server's namespace (#734 follow
             // up): the bare name used to put it in the default namespace.
-            let port_file_base = crate::session::namespaced_session_base(ns.as_deref(), &name);
+            // It is the base the new server writes, so a name `ns__x` under
+            // -L ns is `ns__ns__x` (discussion #844).
+            let port_file_base = crate::session::session_name_base(ns.as_deref(), &name);
 
             let port_path = crate::paths::port_file(&port_file_base);
+
+            let reserved = crate::session::reserved_session_name_error(ns.as_deref(), &name);
 
             // Check if session already exists
             let already_exists = if std::path::Path::new(&port_path).exists() {
@@ -6275,13 +6297,31 @@ match cmd {
                 } else { false }
             } else { false };
 
-            if already_exists {
+            if let Some(msg) = reserved {
+                // Discussion #844: refused like a duplicate, nothing is made.
+                if persistent {
+                    let _ = tx.send(CtrlReq::StatusMessage(msg));
+                } else {
+                    let _ = write!(write_stream, "{}\n", msg);
+                    let _ = write_stream.flush();
+                    break;
+                }
+            } else if already_exists {
                 // tmux's wording (cmd-new-session.c:138), the same string the CLI
                 // path has printed since discussion #210; gastown greps for it.
                 if persistent {
                     let _ = tx.send(CtrlReq::StatusMessage(format!("duplicate session: {}", name)));
                 } else {
                     let _ = write!(write_stream, "duplicate session: {}\n", name);
+                    let _ = write_stream.flush();
+                    break;
+                }
+            } else if let Err(e) = crate::server::shared::check_server_start() {
+                // #798: the switch says shared (or is bad); start nothing here.
+                if persistent {
+                    let _ = tx.send(CtrlReq::StatusMessage(e));
+                } else {
+                    let _ = writeln!(write_stream, "ERROR: {}", e);
                     let _ = write_stream.flush();
                     break;
                 }
@@ -6745,6 +6785,35 @@ fn dispatch_control_command(
                 let _ = tx.send(CtrlReq::NewFloat { command: p.command, x: p.x, y: p.y, w: p.w, h: p.h, border: p.border, title: p.title, start_dir: p.start_dir, detached: p.detached, empty: p.empty, resp: None, extra: p.extra });
                 false
             }
+        }
+        // tmux runs new-session from a control client like from any client
+        // (cmd-new-session.c): the session is created, `-P` prints its report,
+        // a clash is `duplicate session: K`, and the control client hears
+        // %sessions-changed. It fell to the catch all here, so a control
+        // client could not create a session at all. The real CLI new-session
+        // runs in this server's namespace, the same route a forwarded one-shot
+        // `new-session -d` takes. It always runs detached: a psmux control
+        // client is bound to the one session server it attached to, so the
+        // switch tmux makes without -d is not available to it.
+        "new-session" | "new" => {
+            let mut ns_args: Vec<&str> = args.to_vec();
+            if !ns_args.iter().any(|a| *a == "-d") {
+                ns_args.insert(0, "-d");
+            }
+            if let Some(t) = raw_target {
+                if !ns_args.iter().any(|a| *a == "-t") {
+                    ns_args.push("-t");
+                    ns_args.push(t);
+                }
+            }
+            let out = run_cli_new_session(&ns_args);
+            let reply = match out.lines().find_map(|l| l.strip_prefix("ERROR: ")) {
+                Some(err) => format!("\u{0001}ERR\u{0001}{}", err),
+                None if out == "OK\n" => String::new(),
+                None => out.trim_end_matches('\n').to_string(),
+            };
+            let _ = resp_tx.send(reply);
+            true
         }
         "new-window" | "neww" => {
             let name = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());

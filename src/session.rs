@@ -164,12 +164,71 @@ pub fn session_namespace(full: &str) -> Option<&str> {
 /// such as `PSMUX_TARGET_SESSION` and a resolved `$N` id already carry the
 /// on disk name (`ns__sess`). Adding the prefix only when it is missing maps
 /// both spellings onto the same identity, so the prefix is never doubled.
+///
+/// A session may itself be named `ns__x` (discussion #844): its base is
+/// `ns__ns__x`, so when that registry entry exists the name is read as a
+/// session name and prefixed like any other. Otherwise `ns__x` is taken to be
+/// a base already, as before.
 pub fn namespaced_session_base(ns: Option<&str>, name: &str) -> String {
+    namespaced_session_base_with(ns, name, |base| {
+        std::path::Path::new(&crate::paths::port_file(base)).exists()
+    })
+}
+
+/// [`namespaced_session_base`] with the registry lookup passed in, so the rule
+/// can be tested without a data dir. `registered(base)` says whether a session
+/// with that base exists.
+pub fn namespaced_session_base_with(
+    ns: Option<&str>,
+    name: &str,
+    registered: impl Fn(&str) -> bool,
+) -> String {
     match ns {
-        Some(n) if !n.is_empty() && !name.starts_with(&format!("{}__", n)) => {
-            format!("{}__{}", n, name)
+        Some(n) if !n.is_empty() => {
+            let prefixed = session_name_base(ns, name);
+            if !name.starts_with(&format!("{}__", n)) || registered(&prefixed) {
+                prefixed
+            } else {
+                name.to_string()
+            }
         }
         _ => name.to_string(),
+    }
+}
+
+/// The registry base a session NAMED `name` gets under namespace `ns`: the
+/// name with the `<ns>__` prefix under `-L`, the name alone otherwise. This is
+/// what `AppState::port_file_base` writes, so a new or renamed session must be
+/// checked against this and never against [`namespaced_session_base`], which
+/// reads a `-t` that may already be a base.
+pub fn session_name_base(ns: Option<&str>, name: &str) -> String {
+    match ns {
+        Some(n) => format!("{}__{}", n, name),
+        None => name.to_string(),
+    }
+}
+
+/// Why `name` cannot be the name of a new or renamed session in namespace
+/// `ns`, as the error line to print, or None when it can.
+///
+/// The registry stores session `B` of `-L A` as `A__B` and a default namespace
+/// session under its name alone, so a default namespace session named `A__B`
+/// would share every registry file with `-L A`'s `B` and be read back as
+/// belonging to namespace `A` (discussion #844): listed and killed there,
+/// missing from its own `ls`. The file names cannot change without breaking
+/// the tools that read them, so the default namespace refuses `__` in a
+/// session name, as tmux refuses a name it cannot store (`invalid session:`).
+/// Under `-L` a name may contain `__`: the base splits at the first `__`.
+pub fn reserved_session_name_error(ns: Option<&str>, name: &str) -> Option<String> {
+    let in_default = ns.is_none_or(|n| n.is_empty());
+    if in_default && name.contains("__") {
+        Some(format!(
+            "invalid session: {} (psmux stores the sessions of -L NAME as NAME__session, \
+             so a session outside -L cannot have __ in its name)",
+            name
+        ))
+    } else {
+        None
     }
 }
 
@@ -799,8 +858,21 @@ fn pid_owns_live_server(pid: u32) -> bool {
     // handle and would otherwise prune a live server's satellites.
     match crate::platform::process_info::get_process_name_or_snapshot(pid) {
         None => false,
-        Some(name) => PSMUX_SERVER_IMAGE_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            // A renamed binary's servers carry its own image name. Answering
+            // "live" only keeps files, the safe direction for this sweep.
+            PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str())
+                || own_image_stem().as_deref() == Some(name.as_str())
+        }
     }
+}
+
+/// Lower-case file stem of the running executable, e.g. `psmux-dev` for a
+/// renamed copy, so registry readers recognise servers it started itself.
+fn own_image_stem() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.file_stem()?.to_string_lossy().to_ascii_lowercase())
 }
 
 /// Instance-token file names (`instances/<prefix>-<hash>`) that a namespace with
@@ -1808,7 +1880,24 @@ where
     let pid_path = port_path.with_extension("pid");
     // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
     // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    let (pid, creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    pid_anchor_verdict_for(&pid_path, pid, creation, name_of, crate::platform::process_kill::process_creation_time)
+}
+
+/// The verdict half of [`pid_anchor_verdict_with`] once the `.pid` body is
+/// parsed, with the creation time lookup injected as well so a test can drive
+/// a renamed server image without spawning one.
+fn pid_anchor_verdict_for<F, C>(
+    pid_path: &Path,
+    pid: u32,
+    recorded_creation: Option<u64>,
+    name_of: F,
+    creation_of: C,
+) -> Option<bool>
+where
+    F: Fn(u32) -> Option<String>,
+    C: Fn(u32) -> Option<u64>,
+{
     let name = match name_of(pid) {
         // No such process anywhere on the machine — not openable AND not in the
         // process table. That is a genuinely dead PID, so the #448 fast reap
@@ -1827,14 +1916,27 @@ where
         Some(n) => n.to_ascii_lowercase(),
     };
     if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
+        // An image psmux does not know by name is still our server when it is
+        // the very process that wrote the `.pid`: the recorded creation time
+        // pins identity exactly, so a recycled PID can never match it. This is
+        // what keeps a copied or renamed binary (`psmux-dev.exe`, a pinned
+        // `pr123.exe`) usable; judging by name alone made its own CLI call its
+        // freshly started server dead, so `new-session -d` exited 0 and every
+        // later command said "no server running", and a psmux.exe CLI sharing
+        // the data dir deleted the live server's registry files.
+        if let (Some(recorded), Some(created)) = (recorded_creation, creation_of(pid)) {
+            if recorded == created {
+                return Some(true);
+            }
+        }
         // PID recycled by an unrelated application; our server is gone.
         return Some(false);
     }
     // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
     // created well AFTER the .pid file was last written cannot be the server
     // that wrote it. When either timestamp is unavailable, err towards alive.
-    if let Some(created_ft) = crate::platform::process_kill::process_creation_time(pid) {
-        if let Some(mtime_ft) = std::fs::metadata(&pid_path)
+    if let Some(created_ft) = creation_of(pid) {
+        if let Some(mtime_ft) = std::fs::metadata(pid_path)
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(system_time_to_filetime_ticks)
@@ -3502,6 +3604,10 @@ mod tests_picker_namespace_filter;
 mod tests_issue650_cross_session_process_name;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_renamed_server_image_anchor.rs"]
+mod tests_renamed_server_image_anchor;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue698_counter_lock_missing_dir.rs"]
 mod tests_issue698_counter_lock_missing_dir;
 
@@ -3520,3 +3626,7 @@ mod tests_issue809_registry_reply;
 #[cfg(test)]
 #[path = "../tests-rs/test_switch_client_last_namespace.rs"]
 mod tests_switch_client_last_namespace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_discussion844_namespace_names.rs"]
+mod tests_discussion844_namespace_names;

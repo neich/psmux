@@ -363,6 +363,9 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
 pub static VALIDATION_ONLY_OPTIONS: &[ValidationOnlyOptionDef] = &[
     ValidationOnlyOptionDef { name: "message-limit", option_type: Number(I64) },
     ValidationOnlyOptionDef { name: "history-file-limit", option_type: Number(I64) },
+    // #798: chosen when a server starts (server/shared). Known so `set` and
+    // `show` accept it, kept out of the catalog so no listing changes.
+    ValidationOnlyOptionDef { name: "server-mode", option_type: OptionType::String },
 ];
 
 /// Every option name tmux's options table knows, hooks included
@@ -509,6 +512,10 @@ pub fn option_definition(name: &str) -> Option<&'static OptionDef> {
 }
 
 pub fn validate_option_value(name: &str, value: &str) -> Result<(), String> {
+    // #798: a running server cannot change its mode (server/shared).
+    if name == crate::server::shared::OPTION {
+        return crate::server::shared::set_on_running_per_session_server(value);
+    }
     if let Some(definition) = option_definition(name) {
         return definition.validate_value(value);
     }
